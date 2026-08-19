@@ -1,0 +1,7 @@
+{
+  "base_url": "",
+  "api_key": "",
+  "timeout": 8,
+  "verify_ssl": true,
+  "poll_interval": 10
+}

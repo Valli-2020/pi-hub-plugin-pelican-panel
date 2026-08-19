@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+*.tar.gz
+_BRIEF.md

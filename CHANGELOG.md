@@ -6,6 +6,18 @@ assets `pihub-plugin.json` and the versioned tarball.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-19
+
+### Added
+
+- **Configure… button** on the Pelican servers tab: shows the current
+  configuration (base_url, api_key state, timeout, verify_ssl,
+  poll_interval) in a toast; the same values are now rendered as rows in
+  the tab payload so the active configuration is always visible.
+- `POST /config` accepts bodyless requests (the tab button) and returns
+  a summary `message` for the toast; with a body it persists fields as
+  before (validation + clamping unchanged).
+
 ## [1.0.0] - 2026-08-19
 
 ### Added

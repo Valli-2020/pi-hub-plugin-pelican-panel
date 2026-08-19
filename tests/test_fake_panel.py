@@ -42,6 +42,8 @@ _spec.loader.exec_module(_mod)
 
 PelicanPanelPlugin = _mod.PelicanPanelPlugin
 valid_base_url = _mod.valid_base_url
+MAX_TIMEOUT = _mod.MAX_TIMEOUT
+MIN_POLL = _mod.MIN_POLL
 
 PASS = 0
 
@@ -345,10 +347,46 @@ def main() -> None:
             payload = plugin.status_handler()[0]
             check("status payload flat scalars + servers",
                   payload["api_key"] == "set" and payload["stale"] is False
-                  and isinstance(payload["servers"], list),
+                  and isinstance(payload["servers"], list)
+                  and payload["timeout"] == 5
+                  and payload["poll_interval"] == 10,
                   str(payload))
             check("real api key never leaked",
                   "test-key-123" not in json.dumps(payload))
+
+            print("== config button ==")
+            bodyless, code = plugin.config_handler()
+            check("config bodyless 200", code == 200, str(code))
+            cfg_out = bodyless["config"]
+            check("config shows masked key + values",
+                  cfg_out["api_key"] == "set"
+                  and cfg_out["base_url"] == f"http://127.0.0.1:{panel.port}"
+                  and cfg_out["timeout"] == 5
+                  and cfg_out["poll_interval"] == 10,
+                  str(cfg_out))
+            check("config bodyless toasts summary",
+                  "message" in bodyless
+                  and "POST /api/plugin/pelican-panel/config"
+                  in bodyless["message"],
+                  str(bodyless))
+            _, code = plugin.config_handler(
+                body={"base_url": "https://evil.example.com/path"})
+            check("config rejects path", code == 400, str(code))
+            _, code = plugin.config_handler(
+                body={"base_url": "https://ok.example.com:8443",
+                      "timeout": 999, "poll_interval": -5})
+            check("config clamps values", code == 200, str(code))
+            cfg_out = plugin.config_handler()[0]["config"]
+            check("clamped timeout/poll",
+                  cfg_out["timeout"] == MAX_TIMEOUT
+                  and cfg_out["poll_interval"] == MIN_POLL,
+                  str(cfg_out))
+            # Restore the working panel URL — the clamp test above
+            # mutated the live config.
+            _, code = plugin.config_handler(
+                body={"base_url": f"http://127.0.0.1:{panel.port}",
+                      "timeout": 5, "poll_interval": 10})
+            check("config restored", code == 200, str(code))
 
             print("== bodyless actions ==")
             _, code = plugin.start_stopped_handler()

@@ -222,7 +222,7 @@ def _allocations_of(attributes: dict[str, Any]) -> list[dict[str, Any]]:
 
 class PelicanPanelPlugin(Plugin):
     name = "pelican-panel"
-    version = "1.0.0"
+    version = "1.1.0"
     description = (
         "Live Pelican Panel server table (state, CPU, RAM, disk, IP) with "
         "start / stop / restart / kill actions"
@@ -308,6 +308,8 @@ class PelicanPanelPlugin(Plugin):
                     ActionDef("restart-running", "Restart running",
                               style="secondary", caps=["admin"]),
                     ActionDef("kill-running", "Kill running",
+                              style="secondary", caps=["admin"]),
+                    ActionDef("config", "Configure…",
                               style="secondary", caps=["admin"]),
                 ],
             ),
@@ -643,6 +645,8 @@ class PelicanPanelPlugin(Plugin):
             "base_url": cfg["base_url"],
             "api_key": "set" if cfg["api_key"] else "",
             "verify_ssl": cfg["verify_ssl"],
+            "timeout": cfg["timeout"],
+            "poll_interval": cfg["poll_interval"],
             "stale": stale,
             "age_seconds": int(time.monotonic() - last_ok) if last_ok else -1,
             "running": running,
@@ -730,7 +734,18 @@ class PelicanPanelPlugin(Plugin):
         out = self._config_snapshot()
         # The key is write-only: accepted above, never echoed back.
         out["api_key"] = "set" if out["api_key"] else ""
-        return {"config": out}, 200
+        result: dict[str, Any] = {"config": out}
+        # Bodyless POST (the Configure… tab button): the core renderer
+        # toasts `message` from the top level, so summarize the current
+        # values there.
+        if not body:
+            result["message"] = (
+                f"Config: base_url={out['base_url'] or '(empty)'}, "
+                f"api_key={out['api_key']}, timeout={out['timeout']}s, "
+                f"verify_ssl={out['verify_ssl']}, "
+                f"poll_interval={out['poll_interval']}s — change via "
+                f"POST /api/plugin/pelican-panel/config (see README)")
+        return result, 200
 
     # ── Power task ─────────────────────────────────────────────────────────
 

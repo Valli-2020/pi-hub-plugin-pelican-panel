@@ -76,6 +76,7 @@ curl -X POST http://raspberrypi:8898/api/plugin/pelican-panel/config \
 | **Stop running** | Sends `stop` to every running server |
 | **Restart running** | Sends `restart` to every running server |
 | **Kill running** | Sends `kill` (SIGKILL) to every running server |
+| **Configure…** | Shows the current configuration (base_url, api_key state, timeout, verify_ssl, poll_interval) in a toast; the same values are always visible as rows in the tab |
 
 Power actions run as a background task (single-flight — a second action
 while one runs is refused with `409`) and end with a toast. The tab is
@@ -83,6 +84,11 @@ polled every 10 s; the table may lag a power action by one panel-side
 cache window — the Pelican panel caches `/resources` for ~20 s, so a
 just-started server can still show `stopped` for a few seconds. That is
 the panel's cache, not a bug.
+
+> The Pi Hub plugin tab renderer has no form dialogs, so the Configure…
+> button shows the current values but cannot edit them in place. Change
+> values with `POST /config` (see below) or by editing the plugin's
+> `config.json` and re-enabling the plugin.
 
 ## API (for scripting)
 

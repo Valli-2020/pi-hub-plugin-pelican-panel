@@ -1,6 +1,6 @@
 {
   "name": "pelican-panel",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Live Pelican Panel server table (state, CPU, RAM, disk, IP) with start / stop / restart / kill actions",
   "min_core_version": "7.3.2",
   "plugin_api_version": 1,

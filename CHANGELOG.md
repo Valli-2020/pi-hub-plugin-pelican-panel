@@ -6,6 +6,17 @@ assets `pihub-plugin.json` and the versioned tarball.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-08-19
+
+### Added
+
+- **Configure… button opens a form dialog** on Pi Hub **7.7+** (core
+  `ActionDef.fields`): edit `base_url`, `api_key`, `timeout`,
+  `verify_ssl` and `poll_interval` directly in the dialog and save —
+  values POST as JSON to the existing `/config` route. On older cores
+  the button falls back to the v1.1.0 summary toast; the plugin keeps
+  `min_core_version 7.3.2`.
+
 ## [1.1.0] - 2026-08-19
 
 ### Added

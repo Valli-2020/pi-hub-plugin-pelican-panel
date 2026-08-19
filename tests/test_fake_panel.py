@@ -355,6 +355,14 @@ def main() -> None:
                   "test-key-123" not in json.dumps(payload))
 
             print("== config button ==")
+            ui = plugin.get_ui()[0]
+            config_action = next(a for a in ui.actions if a.id == "config")
+            check("config action declares fields",
+                  len(config_action.fields) == 5, str(config_action.fields))
+            check("field types allowlisted",
+                  {f["type"] for f in config_action.fields}
+                  <= {"text", "password", "number", "checkbox"},
+                  str(config_action.fields))
             bodyless, code = plugin.config_handler()
             check("config bodyless 200", code == 200, str(code))
             cfg_out = bodyless["config"]
@@ -387,6 +395,19 @@ def main() -> None:
                 body={"base_url": f"http://127.0.0.1:{panel.port}",
                       "timeout": 5, "poll_interval": 10})
             check("config restored", code == 200, str(code))
+            # Dialog payload shape: number inputs send strings, checkbox
+            # sends a bool — the handler must accept both.
+            _, code = plugin.config_handler(
+                body={"timeout": "12", "verify_ssl": False})
+            cfg_out = plugin.config_handler()[0]["config"]
+            check("dialog payload shape accepted",
+                  code == 200 and cfg_out["timeout"] == 12
+                  and cfg_out["verify_ssl"] is False,
+                  str(cfg_out))
+            _, code = plugin.config_handler(
+                body={"timeout": 5, "verify_ssl": True,
+                      "base_url": f"http://127.0.0.1:{panel.port}"})
+            check("config re-restored", code == 200, str(code))
 
             print("== bodyless actions ==")
             _, code = plugin.start_stopped_handler()

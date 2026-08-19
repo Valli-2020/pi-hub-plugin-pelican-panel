@@ -222,7 +222,7 @@ def _allocations_of(attributes: dict[str, Any]) -> list[dict[str, Any]]:
 
 class PelicanPanelPlugin(Plugin):
     name = "pelican-panel"
-    version = "1.1.0"
+    version = "1.2.0"
     description = (
         "Live Pelican Panel server table (state, CPU, RAM, disk, IP) with "
         "start / stop / restart / kill actions"
@@ -310,7 +310,25 @@ class PelicanPanelPlugin(Plugin):
                     ActionDef("kill-running", "Kill running",
                               style="secondary", caps=["admin"]),
                     ActionDef("config", "Configure…",
-                              style="secondary", caps=["admin"]),
+                              style="secondary", caps=["admin"],
+                              # Core 7.7+ renders a form dialog from this
+                              # schema; older cores POST bodyless and get
+                              # the summary toast instead.
+                              fields=[
+                                  {"name": "base_url", "label": "Panel URL",
+                                   "type": "text",
+                                   "placeholder": "https://panel.example.com"},
+                                  {"name": "api_key", "label": "API key",
+                                   "type": "password"},
+                                  {"name": "timeout", "label": "Timeout (s)",
+                                   "type": "number", "default": 8},
+                                  {"name": "verify_ssl",
+                                   "label": "Verify SSL",
+                                   "type": "checkbox", "default": True},
+                                  {"name": "poll_interval",
+                                   "label": "Poll interval (s)",
+                                   "type": "number", "default": 10},
+                              ]),
                 ],
             ),
         ]

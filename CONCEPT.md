@@ -1,5 +1,9 @@
 # Concept: Pi Hub Plugin — Pelican Panel
 
+> Written for 1.x (Plugin API v1). 2.0.0 moved to API v2: frame tab,
+> header pill, Settings card, Configure dialog — see README and CHANGELOG.
+> The API facts below still hold.
+
 **Status:** v2 — revised after Claude Code Opus 5 cross-check (22 findings,
 all resolved; see §10). Ready for implementation.
 
@@ -49,7 +53,10 @@ uses the full `uuid` from the list.
 Important semantics:
 
 - **Power state comes ONLY from `/resources`** (`current_state`:
-  `starting/running/stopping/stopped`). The list's `status` field is the
+  `starting/running/stopping/offline`; corrected 2026-10-01 from
+  `stopped`, which Pelican's `ContainerStatus` enum does not have — see
+  `app/Enums/ContainerStatus.php`; 1.x showed stopped servers as
+  unavailable because of this). The list's `status` field is the
   *install/suspend* state (`null`, `installing`, `suspended`) — do NOT
   confuse the two. The list's `is_suspended`/`is_installing` flags gate
   what we show/allow.

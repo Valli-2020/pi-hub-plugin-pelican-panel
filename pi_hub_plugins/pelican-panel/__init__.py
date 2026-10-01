@@ -1,53 +1,56 @@
-"""Pelican Panel plugin — live server table plus power actions.
+"""Pelican Panel plugin (Plugin API v2): game-server monitor and power control.
 
 Talks to the Pelican **client** API (`/api/client/...`) over plain
-``urllib``; the plugin needs no core capability at all (no SSH, no hosts,
-no Proxmox) — least privilege.
+``urllib`` (see ``client.py``); no core system capability is needed, only
+UI grants: a sandboxed frame for the tab, a header pill and a Settings card.
 
-Two moving parts:
+Moving parts:
 
 * a **background refresher thread** that rebuilds a snapshot every
   ``poll_interval`` seconds (server list once, per-server ``/resources``
-  in parallel through one long-lived executor) and swaps it under a lock,
-  so ``GET /status`` never does panel I/O and multi-tab browsers cannot
-  multiply the fan-out;
+  in parallel through one long-lived executor), swaps it under a lock and
+  appends CPU/RAM samples to a one-hour history.  ``GET /monitor`` and the
+  UI providers never do panel I/O.  A power action or "Refresh now" kicks
+  the loop early;
 * a **single-flight power task** that walks the selected servers and
-  POSTs ``{"signal": ...}`` to each one.
+  POSTs ``{"signal": ...}`` to each one;
+* the **frame** (``static/frame/monitor.js``) that draws one card per
+  server with sparklines and per-server buttons.
 
 Semantics worth remembering when reading this file:
 
-* Power state comes ONLY from ``/resources`` (``current_state``).  The
-  list's ``status`` field is the *install/suspend* state.
+* Power state comes ONLY from ``/resources`` (``current_state``, Pelican's
+  ``ContainerStatus``: ``offline``/``starting``/``running``/``stopping``
+  plus rarer values folded in by ``STATE_ALIASES``; there is no
+  ``stopped``).  The list's
+  ``status`` field is the *install/suspend* state.
 * ``/resources`` reports bytes; the list's ``limits`` are MiB with ``0``
   meaning unlimited.  ``cpu_absolute`` is a percentage where 100 % is one
   core.  Wings reports ``uptime`` in milliseconds.
-* The panel caches ``/resources`` for ~20 s, so a power action may not
-  show up in the table until the next cache window — documented in the
-  README, not a bug.
+* The panel caches ``/resources`` for ~20 s, so a power action shows up a
+  little late; until then the server is flagged ``pending``.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import math
-import re
-import ssl
 import threading
 import time
-import urllib.error
-import urllib.request
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from pi_hub.plugins.base import (
-    ActionDef,
+    Contribution,
+    FrameDef,
     Plugin,
     PluginContext,
     RouteDef,
-    TabUIDef,
     thread_cancel,
 )
+
+from .client import PanelError, request, valid_base_url
 
 log = logging.getLogger(__name__)
 
@@ -69,28 +72,25 @@ SIGNAL_DONE = {
     "kill": "killed",
 }
 
-#: Which power states a bodyless action targets.
-ACTION_TARGETS = {
-    "start-stopped": ("start", ("stopped",)),
+#: Which power states a bulk action targets.
+BULK_ACTIONS = {
+    "start-stopped": ("start", ("offline",)),
     "stop-running": ("stop", ("running",)),
     "restart-running": ("restart", ("running",)),
-    "kill-running": ("kill", ("running",)),
 }
 
-#: Placeholder for every value we could not determine.  Never ``None`` —
-#: the generic renderer would print the literal string "None".
-DASH = "–"
-INFINITY = "∞"
-
-#: Scheme + host + optional port, nothing else.  ``fullmatch`` (not a
-#: ``$``-anchored search, which would accept a trailing newline) plus an
-#: explicit CR/LF check.  IPv6 literals and sub-path installs are
-#: deliberately unsupported — see README "Limitations".
-_BASE_URL_RE = re.compile(r"https?://[A-Za-z0-9.\-]+(:[0-9]{1,5})?")
-
-#: Every row carries exactly these keys, in this order — a missing key
-#: would shift the generic renderer's table columns.
-ROW_KEYS = ("name", "status", "cpu", "ram", "disk", "ip", "uptime")
+#: Wings power states the UI knows.
+LIVE_STATES = ("running", "offline", "starting", "stopping")
+#: Other ``current_state`` values (Pelican ``ContainerStatus``) folded
+#: into the four above; anything else renders as ``unavailable``.
+STATE_ALIASES = {
+    "stopped": "offline",
+    "exited": "offline",
+    "missing": "offline",
+    "dead": "offline",
+    "created": "offline",
+    "restarting": "starting",
+}
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "base_url": "",
@@ -98,94 +98,34 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "timeout": 8,
     "verify_ssl": True,
     "poll_interval": 10,
+    "notify_crash": True,
 }
 
 MIN_TIMEOUT, MAX_TIMEOUT = 1, 120
 MIN_POLL, MAX_POLL = 5, 3600
-RATE_LIMIT_BACKOFF_S = 60
 MAX_PAGES = 50           # page-loop guard against a misbehaving panel
 MAX_WORKERS = 8
 
+HISTORY_S = 3600         # sparkline window
+BUCKET_S = 30            # one sparkline point per 30 s -> 120 points
+PENDING_TTL_S = 60       # how long a server shows "starting…" etc. at most
+OWN_ACTION_GRACE_S = 180  # a stop within this window was ours, not a crash
 
-class PanelError(Exception):
-    """A failed panel request, reduced to a user-safe ``kind``.
-
-    ``kind`` is one of ``unauthorized`` / ``unavailable`` / ``rate
-    limited`` / ``unreachable`` / ``error``.  The detailed cause stays in
-    ``detail`` and only ever reaches the server log.
-    """
-
-    def __init__(self, kind: str, detail: str = "", retry_after: float = 0.0):
-        super().__init__(kind)
-        self.kind = kind
-        self.detail = detail
-        self.retry_after = retry_after
+ICON_SVG = (
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+    'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+    '<rect x="3" y="4" width="18" height="7" rx="2"/>'
+    '<rect x="3" y="13" width="18" height="7" rx="2"/>'
+    '<path d="M7 7.5h.01M7 16.5h.01"/></svg>'
+)
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Refuse every redirect.
-
-    urllib's default handler would replay the ``Authorization`` header
-    against the redirect target — a one-hop API key exfiltration.
-    Returning ``None`` makes urllib raise the 3xx as an ``HTTPError``.
-    """
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
+def _num(value: Any) -> float | None:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
         return None
-
-
-def valid_base_url(url: str) -> bool:
-    """True when *url* is a bare ``scheme://host[:port]`` with no CR/LF."""
-    if not url or "\r" in url or "\n" in url:
-        return False
-    return _BASE_URL_RE.fullmatch(url) is not None
-
-
-def _gib(value: float) -> str:
-    """Format a GiB amount: one decimal below 10, whole numbers above."""
-    return f"{value:.1f}" if value < 10 else f"{value:.0f}"
-
-
-def _fmt_size(used_bytes: Any, limit_mib: Any) -> str:
-    """Render ``used / limit`` in GiB; a limit of 0 means unlimited."""
-    try:
-        used = float(used_bytes) / (1024 ** 3)
-        limit = float(limit_mib) / 1024
-    except (TypeError, ValueError):
-        return DASH
-    if limit <= 0:
-        return f"{_gib(used)} GiB / {INFINITY}"
-    return f"{_gib(used)} / {_gib(limit)} GiB"
-
-
-def _fmt_cpu(value: Any) -> str:
-    """Render ``cpu_absolute`` (100 % = one core) as a whole percentage."""
-    try:
-        return f"{float(value):.0f}%"
-    except (TypeError, ValueError):
-        return DASH
-
-
-def _fmt_uptime(uptime_ms: Any) -> str:
-    """Render Wings' millisecond uptime as ``1d 2h 3m``."""
-    try:
-        seconds = int(float(uptime_ms) / 1000)
-    except (TypeError, ValueError):
-        return DASH
-    if seconds <= 0:
-        return DASH
-    if seconds < 60:
-        return f"{seconds}s"
-    days, rest = divmod(seconds, 86400)
-    hours, rest = divmod(rest, 3600)
-    minutes = rest // 60
-    parts = []
-    if days:
-        parts.append(f"{days}d")
-    if hours:
-        parts.append(f"{hours}h")
-    parts.append(f"{minutes}m")
-    return " ".join(parts)
+    return f if math.isfinite(f) else None
 
 
 def _primary_allocation(allocations: list[dict[str, Any]]) -> str:
@@ -197,11 +137,11 @@ def _primary_allocation(allocations: list[dict[str, Any]]) -> str:
     else:
         chosen = (allocations or [None])[0]
     if not isinstance(chosen, dict):
-        return DASH
+        return ""
     host = str(chosen.get("ip_alias") or chosen.get("ip") or "").strip()
     port = chosen.get("port")
     if not host or port is None:
-        return DASH
+        return ""
     return f"{host}:{port}"
 
 
@@ -220,31 +160,60 @@ def _allocations_of(attributes: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _inert_state(entry: dict[str, Any]) -> str:
+    """Return ``installing``/``suspended`` when the server is not live."""
+    status = str(entry.get("status") or "")
+    if entry.get("is_suspended") or status == "suspended":
+        return "suspended"
+    if entry.get("is_installing") or status == "installing":
+        return "installing"
+    return ""
+
+
+def _fmt_age(seconds: int) -> str:
+    if seconds < 0:
+        return "never"
+    if seconds < 90:
+        return f"{seconds} s ago"
+    return f"{seconds // 60} min ago"
+
+
 class PelicanPanelPlugin(Plugin):
     name = "pelican-panel"
-    version = "1.2.0"
+    version = "2.0.0"
     description = (
-        "Live Pelican Panel server table (state, CPU, RAM, disk, IP) with "
-        "start / stop / restart / kill actions"
+        "Pelican game servers: live monitor with CPU/RAM sparklines, "
+        "per-server start / stop / restart / kill, header pill"
     )
-    min_core_version = "7.3.2"
-    # No core capability: everything happens over the Pelican HTTP API.
-    capabilities: list[str] = []
+    min_core_version = "8.0.0"
+    plugin_api_version = 2
+    # No system capability: everything happens over the Pelican HTTP API.
+    capabilities = ["ui.frame", "ui.header", "ui.settings"]
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     def load(self, ctx: PluginContext) -> None:
         self.ctx = ctx
         self._lock = threading.Lock()
-        self._rows: list[dict[str, Any]] = []
-        self._targets: list[dict[str, str]] = []   # uuid/name/status, internal
+        self._servers: list[dict[str, Any]] = []
         self._last_ok = 0.0
         self._stale = True
         self._error = ""
+        self._error_kind = ""          # "" | config | unauthorized | unreachable | rate | error
         self._running = False
         self._backoff_until = 0.0
         self._stop = threading.Event()
+        self._kick = threading.Event()
         self._executor: ThreadPoolExecutor | None = None
+        # uuid -> deque[(wall ts, cpu %, mem bytes)]
+        self._hist: dict[str, deque] = {}
+        # Refresher-thread only: uuid -> (monotonic, rx bytes, tx bytes)
+        self._net_prev: dict[str, tuple[float, float, float]] = {}
+        # uuid -> (signal, state when issued, monotonic)
+        self._pending: dict[str, tuple[str, str, float]] = {}
+        # uuid -> monotonic of the last power signal we sent
+        self._issued: dict[str, float] = {}
+        self._prev_state: dict[str, str] = {}
 
         cfg = self.ctx.get_config()
         changed = False
@@ -261,6 +230,7 @@ class PelicanPanelPlugin(Plugin):
 
     def unload(self) -> None:
         self._stop.set()
+        self._kick.set()
         thread = getattr(self, "_thread", None)
         if thread is not None:
             thread.join(timeout=3.0)
@@ -269,71 +239,71 @@ class PelicanPanelPlugin(Plugin):
                 self._executor.shutdown(wait=False)
                 self._executor = None
 
+    def migrate_config(self, old_version: str, config: dict) -> dict:
+        # 1.x keys are a subset of 2.0's; only the new defaults are added.
+        for key, value in DEFAULT_CONFIG.items():
+            config.setdefault(key, value)
+        return config
+
+    def get_config_schema(self) -> list[dict]:
+        return [
+            {"name": "base_url", "label": "Panel URL", "type": "text",
+             "required": True, "placeholder": "https://panel.example.com",
+             "help": "scheme://host[:port], no path."},
+            {"name": "api_key", "label": "Client API key", "type": "password",
+             "help": "Panel → Account → API Keys (a client key, not an "
+                     "application key). Left blank keeps the current key."},
+            {"name": "verify_ssl", "label": "Verify SSL", "type": "checkbox",
+             "default": True},
+            {"name": "timeout", "label": "Timeout (s)", "type": "number",
+             "default": 8, "min": MIN_TIMEOUT, "max": MAX_TIMEOUT},
+            {"name": "poll_interval", "label": "Poll interval (s)",
+             "type": "number", "default": 10, "min": MIN_POLL, "max": MAX_POLL},
+            {"name": "notify_crash", "label": "Toast when a server stops "
+             "without Pi Hub", "type": "checkbox", "default": True},
+        ]
+
+    def on_config_change(self, old: dict, new: dict) -> None:
+        # Drop the backoff and history of a different panel, then poll now.
+        if str(old.get("base_url", "")) != str(new.get("base_url", "")):
+            with self._lock:
+                self._servers = []
+                self._hist.clear()
+                self._prev_state.clear()
+                self._last_ok = 0.0
+            self._net_prev.clear()
+        self._backoff_until = 0.0
+        self._kick.set()
+
     # ── Descriptors ────────────────────────────────────────────────────────
 
     def get_routes(self) -> list[RouteDef]:
         return [
-            RouteDef("GET", "/status", self.status_handler, caps=["admin"]),
-            RouteDef("POST", "/start-stopped", self.start_stopped_handler,
-                     caps=["admin"]),
-            RouteDef("POST", "/stop-running", self.stop_running_handler,
-                     caps=["admin"]),
-            RouteDef("POST", "/restart-running", self.restart_running_handler,
-                     caps=["admin"]),
-            RouteDef("POST", "/kill-running", self.kill_running_handler,
-                     caps=["admin"]),
+            RouteDef("GET", "/monitor", self.monitor_handler, caps=["admin"]),
             RouteDef("POST", "/power", self.power_handler, caps=["admin"]),
-            RouteDef("POST", "/config", self.config_handler, caps=["admin"]),
+            RouteDef("POST", "/bulk/{action}", self.bulk_handler,
+                     caps=["admin"]),
+            RouteDef("POST", "/refresh", self.refresh_handler, caps=["admin"]),
         ]
 
-    def get_ui(self) -> list[Any]:
+    def get_frames(self) -> list[FrameDef]:
+        return [FrameDef(
+            "monitor",
+            entry=["monitor.js"], css=["monitor.css"],
+            surfaces=[{"type": "tab", "label": "Game servers",
+                       "icon_svg": ICON_SVG}],
+            height=420,
+        )]
+
+    def get_contributions(self) -> list[Contribution]:
         return [
-            TabUIDef(
-                id="pelican-panel",
-                label="Pelican servers",
-                icon_svg=(
-                    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
-                    'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
-                    '<rect x="3" y="4" width="18" height="7" rx="2"/>'
-                    '<rect x="3" y="13" width="18" height="7" rx="2"/>'
-                    '<path d="M7 7.5h.01M7 16.5h.01"/></svg>'
-                ),
-                position=10,
-                poll_endpoint="/api/plugin/pelican-panel/status",
-                actions=[
-                    ActionDef("start-stopped", "Start stopped",
-                              style="primary", caps=["admin"]),
-                    ActionDef("stop-running", "Stop running",
-                              style="secondary", caps=["admin"]),
-                    ActionDef("restart-running", "Restart running",
-                              style="secondary", caps=["admin"]),
-                    ActionDef("kill-running", "Kill running",
-                              style="secondary", caps=["admin"]),
-                    ActionDef("config", "Configure…",
-                              style="secondary", caps=["admin"],
-                              # Core 7.7+ renders a form dialog from this
-                              # schema; older cores POST bodyless and get
-                              # the summary toast instead.
-                              fields=[
-                                  {"name": "base_url", "label": "Panel URL",
-                                   "type": "text",
-                                   "placeholder": "https://panel.example.com"},
-                                  {"name": "api_key", "label": "API key",
-                                   "type": "password"},
-                                  {"name": "timeout", "label": "Timeout (s)",
-                                   "type": "number", "default": 8},
-                                  {"name": "verify_ssl",
-                                   "label": "Verify SSL",
-                                   "type": "checkbox", "default": True},
-                                  {"name": "poll_interval",
-                                   "label": "Poll interval (s)",
-                                   "type": "number", "default": 10},
-                              ]),
-                ],
-            ),
+            Contribution("header.pill", "games", self.p_pill, poll=15,
+                         caps=["admin"]),
+            Contribution("settings.card", "connection", self.p_settings,
+                         poll=30, label="Pelican Panel"),
         ]
 
-    # ── HTTP client ────────────────────────────────────────────────────────
+    # ── Config ─────────────────────────────────────────────────────────────
 
     def _config_snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -346,6 +316,7 @@ class PelicanPanelPlugin(Plugin):
             "verify_ssl": bool(cfg.get("verify_ssl", True)),
             "poll_interval": self._clamp(cfg.get("poll_interval"), MIN_POLL,
                                          MAX_POLL, DEFAULT_CONFIG["poll_interval"]),
+            "notify_crash": bool(cfg.get("notify_crash", True)),
         }
 
     @staticmethod
@@ -355,87 +326,21 @@ class PelicanPanelPlugin(Plugin):
         except (TypeError, ValueError):
             return fallback
 
-    def _request(self, cfg: dict[str, Any], method: str, path: str,
-                 payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Perform one panel request and return the decoded JSON body.
-
-        Raises :class:`PanelError` for every failure; the caller only ever
-        sees the masked ``kind``.
-        """
-        if not valid_base_url(cfg["base_url"]):
-            raise PanelError("error", "base_url invalid")
-        if not cfg["api_key"]:
-            raise PanelError("unauthorized", "api_key not configured")
-
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {cfg['api_key']}",
-        }
-        data = None
-        if payload is not None:
-            data = json.dumps(payload).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(
-            cfg["base_url"] + path, data=data, headers=headers, method=method)
-
-        # Per-request SSL context when verification is off — mutating the
-        # module-level default would disable verification for the whole
-        # Pi Hub process, not just this plugin.
-        handlers: list[Any] = [_NoRedirect()]
-        if not cfg["verify_ssl"]:
-            insecure = ssl.create_default_context()
-            insecure.check_hostname = False
-            insecure.verify_mode = ssl.CERT_NONE
-            handlers.append(urllib.request.HTTPSHandler(context=insecure))
-        opener = urllib.request.build_opener(*handlers)
-
-        try:
-            with opener.open(req, timeout=cfg["timeout"]) as resp:
-                raw = resp.read()
-            if not raw:
-                return {}
-            return json.loads(raw.decode("utf-8", "replace"))
-        except urllib.error.HTTPError as e:
-            raise self._http_error(e, method, path) from None
-        except urllib.error.URLError as e:
-            log.warning("pelican-panel: %s %s unreachable: %s", method, path,
-                        e.reason)
-            raise PanelError("unreachable", str(e.reason)) from None
-        except (OSError, ValueError) as e:
-            log.warning("pelican-panel: %s %s failed: %s", method, path, e)
-            raise PanelError("unreachable", str(e)) from None
-
-    @staticmethod
-    def _http_error(e: urllib.error.HTTPError, method: str,
-                    path: str) -> PanelError:
-        """Map an HTTP status onto a masked :class:`PanelError`."""
-        log.warning("pelican-panel: %s %s returned HTTP %s", method, path, e.code)
-        if e.code in (401, 403):
-            return PanelError("unauthorized", f"HTTP {e.code}")
-        if e.code == 409:
-            return PanelError("unavailable", "HTTP 409")
-        if e.code == 429:
-            retry_after = RATE_LIMIT_BACKOFF_S
-            header = e.headers.get("Retry-After") if e.headers else None
-            try:
-                if header is not None:
-                    retry_after = max(1.0, float(str(header).strip()))
-            except ValueError:
-                pass
-            return PanelError("rate limited", "HTTP 429", retry_after)
-        return PanelError("error", f"HTTP {e.code}")
-
     # ── Refresher ──────────────────────────────────────────────────────────
 
     def _refresh_loop(self) -> None:
         while not self._stop.is_set():
             try:
                 delay = self._refresh_once()
+            except PanelError:
+                if self._stop.is_set():       # unloaded mid-cycle
+                    return
+                delay = float(DEFAULT_CONFIG["poll_interval"])
             except Exception as e:            # a crashed refresher is worse
                 log.exception("pelican-panel: refresh cycle crashed: %s", e)
                 delay = float(DEFAULT_CONFIG["poll_interval"])
-            if self._stop.wait(delay):
-                return
+            self._kick.wait(delay)
+            self._kick.clear()
 
     def _refresh_once(self) -> float:
         """Rebuild the snapshot.  Returns the seconds to sleep afterwards."""
@@ -447,45 +352,51 @@ class PelicanPanelPlugin(Plugin):
             return min(remaining, interval)
 
         if not cfg["base_url"] or not cfg["api_key"]:
-            self._mark_failed("not configured — set base_url and api_key")
+            self._mark_failed("not configured — set the panel URL and API key",
+                              "config")
             return interval
         if not valid_base_url(cfg["base_url"]):
-            self._mark_failed("base_url invalid")
+            self._mark_failed("panel URL invalid — use scheme://host[:port]",
+                              "config")
             return interval
 
         try:
             entries = self._fetch_servers(cfg)
         except PanelError as e:
             if e.kind == "unauthorized":
-                self._mark_failed("API key invalid or expired")
+                self._mark_failed("API key invalid or expired", "unauthorized")
             elif e.kind == "rate limited":
                 self._backoff_until = time.monotonic() + e.retry_after
-                self._mark_failed("rate limited")
+                self._mark_failed("rate limited", "rate")
                 return min(e.retry_after, interval)
+            elif e.kind == "unreachable":
+                self._mark_failed("panel unreachable", "unreachable")
             else:
-                message = ("panel unreachable" if e.kind == "unreachable"
-                           else "panel error")
-                self._mark_failed(message)
+                self._mark_failed("panel error", "error")
             return interval
 
-        rows, targets = self._build_snapshot(cfg, entries)
+        servers = self._build_snapshot(cfg, entries)
+        crashed = self._track(servers, cfg)
         with self._lock:
-            self._rows = rows
-            self._targets = targets
+            self._servers = servers
             # monotonic: age_seconds must never jump on an NTP step.
             self._last_ok = time.monotonic()
             self._stale = False
             self._error = ""
+            self._error_kind = ""
+        for name in crashed:
+            self._safe_toast(f"{name} stopped (not by Pi Hub)", "err")
         # Auto-scale: ~1 + N requests per cycle, so a large panel polls
         # slower and never saturates the client API's rate limit.
-        scaled = math.ceil(len(rows) / 5) * 10
+        scaled = math.ceil(len(servers) / 5) * 10
         return float(max(cfg["poll_interval"], scaled))
 
-    def _mark_failed(self, message: str) -> None:
-        """Keep the last good rows, flag the snapshot stale, set the error."""
+    def _mark_failed(self, message: str, kind: str) -> None:
+        """Keep the last good snapshot, flag it stale, set the error."""
         with self._lock:
             self._stale = True
             self._error = message
+            self._error_kind = kind
 
     def _fetch_servers(self, cfg: dict[str, Any]) -> list[dict[str, Any]]:
         """Fetch every page of the client server list, unwrapped.
@@ -508,7 +419,7 @@ class PelicanPanelPlugin(Plugin):
             query = f"/api/client?per_page=100&page={page}"
             if admin_all:
                 query += "&type=admin-all"
-            body = self._request(cfg, "GET", query)
+            body = request(cfg, "GET", query)
             for item in body.get("data") or []:
                 if not isinstance(item, dict):
                     continue
@@ -540,10 +451,9 @@ class PelicanPanelPlugin(Plugin):
                     max_workers=MAX_WORKERS, thread_name_prefix="pelican-res")
             return self._executor
 
-    def _build_snapshot(
-        self, cfg: dict[str, Any], entries: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-        pollable = [e for e in entries if not self._inert_state(e)]
+    def _build_snapshot(self, cfg: dict[str, Any],
+                        entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        pollable = [e for e in entries if not _inert_state(e)]
         results: dict[str, dict[str, Any] | None] = {}
         ips: dict[str, str] = {}
         if pollable:
@@ -575,106 +485,204 @@ class PelicanPanelPlugin(Plugin):
                 else:
                     results[key] = value
 
-        rows: list[dict[str, Any]] = []
-        targets: list[dict[str, str]] = []
-        for entry in entries:
-            uuid = str(entry["uuid"])
-            row = self._build_row(cfg, entry, results.get(uuid),
-                                  ips.get(uuid))
-            rows.append(row)
-            # Inert servers (installing/suspended) are never power
-            # targets — every power path then needs no re-filtering.
-            if not self._inert_state(entry):
-                targets.append({"uuid": uuid, "name": row["name"],
-                                "status": row["status"]})
-        return rows, targets
+        now = time.monotonic()
+        servers = [self._build_server(e, results.get(str(e["uuid"])),
+                                      ips.get(str(e["uuid"]), ""), now)
+                   for e in entries]
+        live = {s["uuid"] for s in servers}
+        for uuid in list(self._net_prev):
+            if uuid not in live:
+                del self._net_prev[uuid]
+        return servers
 
     def _fetch_resources(self, cfg: dict[str, Any], uuid: str) -> dict[str, Any]:
-        body = self._request(cfg, "GET", f"/api/client/servers/{uuid}/resources")
+        body = request(cfg, "GET", f"/api/client/servers/{uuid}/resources")
         attributes = body.get("attributes")
         return attributes if isinstance(attributes, dict) else {}
 
     def _fetch_ip(self, cfg: dict[str, Any], uuid: str) -> str:
         """Fallback primary allocation via the per-server detail call."""
-        body = self._request(cfg, "GET", f"/api/client/servers/{uuid}")
+        body = request(cfg, "GET", f"/api/client/servers/{uuid}")
         attributes = body.get("attributes")
         if not isinstance(attributes, dict):
             return ""
         return _primary_allocation(_allocations_of(attributes))
 
-    @staticmethod
-    def _inert_state(entry: dict[str, Any]) -> str:
-        """Return ``installing``/``suspended`` when the server is not live."""
-        status = str(entry.get("status") or "")
-        if entry.get("is_suspended") or status == "suspended":
-            return "suspended"
-        if entry.get("is_installing") or status == "installing":
-            return "installing"
-        return ""
-
-    def _build_row(self, cfg: dict[str, Any], entry: dict[str, Any],
-                   resources: dict[str, Any] | None,
-                   ip: str = "") -> dict[str, Any]:
+    def _build_server(self, entry: dict[str, Any],
+                      resources: dict[str, Any] | None,
+                      ip: str, now: float) -> dict[str, Any]:
+        """One server as raw numbers; ``None`` = unknown.  Sizes in bytes."""
         limits = entry.get("limits")
         if not isinstance(limits, dict):
             limits = {}
-        row: dict[str, Any] = {
-            "name": str(entry.get("name") or entry.get("uuid") or DASH),
-            "status": "unavailable",
-            "cpu": DASH,
-            "ram": DASH,
-            "disk": DASH,
-            "ip": ip or _primary_allocation(_allocations_of(entry)) or DASH,
-            "uptime": DASH,
+        mib = 1024 * 1024
+        uuid = str(entry["uuid"])
+        server: dict[str, Any] = {
+            "uuid": uuid,
+            "name": str(entry.get("name") or uuid)[:120],
+            "node": str(entry.get("node") or "")[:120],
+            "ip": ip or _primary_allocation(_allocations_of(entry)),
+            "state": "unavailable",
+            "cpu": None,
+            "cpu_limit": _num(limits.get("cpu")) or 0,
+            "mem": None,
+            "mem_limit": (_num(limits.get("memory")) or 0) * mib,
+            "disk": None,
+            "disk_limit": (_num(limits.get("disk")) or 0) * mib,
+            "rx": None,
+            "tx": None,
+            "uptime": None,
         }
-        inert = self._inert_state(entry)
+        inert = _inert_state(entry)
         if inert:
-            row["status"] = inert
-            return row
+            server["state"] = inert
+            return server
         if not resources:
-            return row
+            return server
         state = str(resources.get("current_state") or "")
-        row["status"] = state if state in (
-            "running", "stopped", "starting", "stopping") else "unavailable"
+        state = STATE_ALIASES.get(state, state)
+        server["state"] = state if state in LIVE_STATES else "unavailable"
         usage = resources.get("resources")
         if not isinstance(usage, dict):
-            return row
-        row["cpu"] = _fmt_cpu(usage.get("cpu_absolute"))
-        row["ram"] = _fmt_size(usage.get("memory_bytes"), limits.get("memory", 0))
-        row["disk"] = _fmt_size(usage.get("disk_bytes"), limits.get("disk", 0))
-        row["uptime"] = _fmt_uptime(usage.get("uptime"))
-        # Enforce the identical-key-set invariant: a missing key would
-        # shift the generic renderer's table columns.  KeyError here is a
-        # programming error and crashes the cycle loudly (caught upstream).
-        return {key: row[key] for key in ROW_KEYS}
+            return server
+        server["cpu"] = _num(usage.get("cpu_absolute"))
+        server["mem"] = _num(usage.get("memory_bytes"))
+        server["disk"] = _num(usage.get("disk_bytes"))
+        uptime_ms = _num(usage.get("uptime"))
+        server["uptime"] = int(uptime_ms / 1000) if uptime_ms else None
+        rx, tx = _num(usage.get("network_rx_bytes")), _num(usage.get("network_tx_bytes"))
+        prev = self._net_prev.get(uuid)
+        if rx is not None and tx is not None:
+            if prev is not None and now > prev[0]:
+                drx, dtx = rx - prev[1], tx - prev[2]
+                # Counters reset when the container restarts.
+                if drx >= 0 and dtx >= 0:
+                    server["rx"] = drx / (now - prev[0])
+                    server["tx"] = dtx / (now - prev[0])
+            self._net_prev[uuid] = (now, rx, tx)
+        return server
 
-    # ── Route handlers ─────────────────────────────────────────────────────
+    def _track(self, servers: list[dict[str, Any]],
+               cfg: dict[str, Any]) -> list[str]:
+        """History, pending flags and crash detection for a new snapshot.
 
-    def status_handler(self, **kw: Any) -> tuple[Any, int]:
-        cfg = self._config_snapshot()
+        Returns the names of servers that went running -> offline without
+        a power signal from this plugin (for the toast).
+        """
+        wall = time.time()
+        now = time.monotonic()
+        crashed: list[str] = []
         with self._lock:
-            rows = [dict(r) for r in self._rows]
-            stale = self._stale
-            error = self._error
-            last_ok = self._last_ok
-            running = self._running
-        payload: dict[str, Any] = {
-            "servers": rows,
-            "base_url": cfg["base_url"],
-            "api_key": "set" if cfg["api_key"] else "",
-            "verify_ssl": cfg["verify_ssl"],
-            "timeout": cfg["timeout"],
-            "poll_interval": cfg["poll_interval"],
-            "stale": stale,
-            "age_seconds": int(time.monotonic() - last_ok) if last_ok else -1,
-            "running": running,
+            live = {s["uuid"] for s in servers}
+            for table in (self._hist, self._pending, self._issued, self._prev_state):
+                for uuid in [u for u in table if u not in live]:
+                    del table[uuid]
+            for s in servers:
+                uuid, state = s["uuid"], s["state"]
+                hist = self._hist.get(uuid)
+                if hist is None:
+                    hist = self._hist[uuid] = deque(
+                        maxlen=HISTORY_S // MIN_POLL + 10)
+                running = state in ("running", "starting", "stopping")
+                hist.append((wall, s["cpu"] if running else None,
+                             s["mem"] if running else None))
+                while hist and hist[0][0] < wall - HISTORY_S:
+                    hist.popleft()
+
+                pending = self._pending.get(uuid)
+                if pending and (state != pending[1]
+                                or now - pending[2] > PENDING_TTL_S):
+                    del self._pending[uuid]
+
+                if state not in LIVE_STATES:
+                    continue           # an unavailable cycle is no transition
+                prev = self._prev_state.get(uuid)
+                if prev == "running" and state == "offline":
+                    issued = self._issued.get(uuid)
+                    ours = issued is not None and now - issued < OWN_ACTION_GRACE_S
+                    if not ours and cfg["notify_crash"]:
+                        crashed.append(s["name"])
+                self._prev_state[uuid] = state
+        return crashed
+
+    def _points(self, hist: deque | None, wall: float) -> tuple[list, list]:
+        """Average the history into fixed ``BUCKET_S`` buckets (oldest first).
+
+        ``None`` marks a bucket without a running sample, so the frame
+        draws a gap instead of a fake zero.
+        """
+        n = HISTORY_S // BUCKET_S
+        sums = [[0.0, 0.0, 0] for _ in range(n)]
+        start = wall - HISTORY_S
+        for ts, cpu, mem in hist or ():
+            if cpu is None:
+                continue
+            i = int((ts - start) // BUCKET_S)
+            if 0 <= i < n:
+                bucket = sums[i]
+                bucket[0] += cpu
+                bucket[1] += mem or 0.0
+                bucket[2] += 1
+        cpu_pts = [round(b[0] / b[2], 1) if b[2] else None for b in sums]
+        mem_pts = [int(b[1] / b[2] / (1024 * 1024)) if b[2] else None for b in sums]
+        return cpu_pts, mem_pts
+
+    def _safe_toast(self, message: str, kind: str) -> None:
+        try:
+            self.ctx.toast(message, kind)
+        except Exception:
+            log.exception("pelican-panel: toast failed")
+
+    # ── Views ──────────────────────────────────────────────────────────────
+
+    def _view(self, history: bool = False) -> dict[str, Any]:
+        """A consistent copy of the state for the routes and providers."""
+        with self._lock:
+            return {
+                "servers": [dict(s) for s in self._servers],
+                "pending": {u: p[0] for u, p in self._pending.items()},
+                "stale": self._stale,
+                "error": self._error,
+                "error_kind": self._error_kind,
+                "last_ok": self._last_ok,
+                "running": self._running,
+                "hist": ({u: list(h) for u, h in self._hist.items()}
+                         if history else {}),
+            }
+
+    @staticmethod
+    def _summary(servers: list[dict[str, Any]]) -> dict[str, Any]:
+        running = [s for s in servers if s["state"] == "running"]
+        return {
+            "running": len(running),
+            "total": len(servers),
+            "cpu": round(sum(s["cpu"] or 0 for s in running), 1),
+            "mem": sum(s["mem"] or 0 for s in running),
         }
-        if error:
-            # "notice", NOT "error": the generic renderer short-circuits
-            # on a top-level `error` key and blanks the whole tab
-            # (index.html renderPluginTabData) — the table and action
-            # buttons must stay visible next to the hint.
-            payload["notice"] = error
+
+    def monitor_handler(self, **kw: Any) -> tuple[Any, int]:
+        view = self._view(history=True)
+        cfg = self._config_snapshot()
+        wall = time.time()
+        servers = []
+        for s in view["servers"]:
+            cpu_pts, mem_pts = self._points(view["hist"].get(s["uuid"]), wall)
+            s["pending"] = view["pending"].get(s["uuid"], "")
+            s["cpu_pts"] = cpu_pts
+            s["mem_pts"] = mem_pts
+            servers.append(s)
+        last_ok = view["last_ok"]
+        payload: dict[str, Any] = {
+            "servers": servers,
+            "summary": self._summary(view["servers"]),
+            "configured": bool(cfg["base_url"] and cfg["api_key"]),
+            "stale": view["stale"],
+            "age_seconds": int(time.monotonic() - last_ok) if last_ok else -1,
+            "notice": view["error"],
+            "busy": view["running"],
+            "window_s": HISTORY_S,
+            "bucket_s": BUCKET_S,
+        }
         task = self.ctx.get_task_status(TASK_POWER)
         if isinstance(task, dict):
             payload["task"] = {
@@ -683,32 +691,82 @@ class PelicanPanelPlugin(Plugin):
             }
         return payload, 200
 
-    def start_stopped_handler(self, **kw: Any) -> tuple[Any, int]:
-        return self._action("start-stopped")
+    def p_pill(self, session: Any = None) -> dict[str, Any]:
+        view = self._view()
+        summary = self._summary(view["servers"])
+        title = view["error"] or "Pelican game servers running / total"
+        if view["error_kind"] == "config":
+            return {"type": "badge", "text": "Games: not set up",
+                    "tone": "muted", "title": view["error"]}
+        if not view["last_ok"]:
+            if view["error"]:
+                return {"type": "badge", "text": "Games: " + view["error"],
+                        "tone": "bad", "title": title}
+            return {"type": "badge", "text": "Games …", "tone": "muted",
+                    "title": "waiting for the first poll"}
+        text = f"Games {summary['running']}/{summary['total']}"
+        if view["stale"]:
+            tone = "bad" if view["error_kind"] in ("unauthorized", "unreachable") \
+                else "warn"
+        else:
+            tone = "ok" if summary["running"] else "muted"
+        return {"type": "badge", "text": text, "tone": tone, "title": title}
 
-    def stop_running_handler(self, **kw: Any) -> tuple[Any, int]:
-        return self._action("stop-running")
+    def p_settings(self, session: Any = None) -> dict[str, Any]:
+        view = self._view()
+        cfg = self._config_snapshot()
+        summary = self._summary(view["servers"])
+        age = int(time.monotonic() - view["last_ok"]) if view["last_ok"] else -1
+        rows: list[list[Any]] = [
+            ["Panel URL", cfg["base_url"] or "(not set)"],
+            ["API key", "set" if cfg["api_key"] else "(not set)"],
+            ["Servers", f"{summary['running']} running of {summary['total']}"],
+            ["Last poll", _fmt_age(age)],
+            ["Status", view["error"] or "ok"],
+        ]
+        buttons: list[dict[str, Any]] = [
+            {"type": "button", "label": "Refresh now", "action": "refresh",
+             "style": "secondary"},
+        ]
+        if valid_base_url(cfg["base_url"]):
+            buttons.insert(0, {"type": "link", "text": "Open panel",
+                               "href": cfg["base_url"]})
+        return {"type": "stack", "children": [
+            {"type": "kv", "rows": rows},
+            {"type": "stack", "dir": "row", "children": buttons},
+            {"type": "text", "tone": "muted",
+             "text": "Change URL and key in Settings → Plugins → Configure."},
+        ]}
 
-    def restart_running_handler(self, **kw: Any) -> tuple[Any, int]:
-        return self._action("restart-running")
+    # ── Route handlers ─────────────────────────────────────────────────────
 
-    def kill_running_handler(self, **kw: Any) -> tuple[Any, int]:
-        return self._action("kill-running")
+    def refresh_handler(self, **kw: Any) -> tuple[Any, int]:
+        self._kick.set()
+        return {"success": True, "message": "Refreshing Pelican servers"}, 200
 
-    def _action(self, action_id: str) -> tuple[Any, int]:
-        signal, states = ACTION_TARGETS[action_id]
+    def bulk_handler(self, params: dict | None = None,
+                     **kw: Any) -> tuple[Any, int]:
+        action = str((params or {}).get("action", ""))
+        if action not in BULK_ACTIONS:
+            return {"error": "unknown action"}, 404
+        signal, states = BULK_ACTIONS[action]
         with self._lock:
-            targets = [dict(t) for t in self._targets if t["status"] in states]
+            targets = [{"uuid": s["uuid"], "name": s["name"], "state": s["state"]}
+                       for s in self._servers if s["state"] in states]
         return self._start_power(signal, targets)
 
-    def power_handler(self, **kw: Any) -> tuple[Any, int]:
-        body = kw.get("body") or {}
+    def power_handler(self, body: dict | None = None,
+                      **kw: Any) -> tuple[Any, int]:
+        body = body if isinstance(body, dict) else {}
         signal = str(body.get("signal", ""))
         if signal not in SIGNALS:
             return {"error": "invalid signal"}, 400
         selection = body.get("servers", "all")
         with self._lock:
-            known = [dict(t) for t in self._targets]
+            # Inert servers (installing/suspended) are never power targets.
+            known = [{"uuid": s["uuid"], "name": s["name"], "state": s["state"]}
+                     for s in self._servers
+                     if s["state"] not in ("installing", "suspended")]
         if selection == "all":
             targets = known
         elif isinstance(selection, list):
@@ -718,52 +776,6 @@ class PelicanPanelPlugin(Plugin):
         else:
             return {"error": "invalid servers selector"}, 400
         return self._start_power(signal, targets)
-
-    def config_handler(self, **kw: Any) -> tuple[Any, int]:
-        body = kw.get("body") or {}
-        if "base_url" in body:
-            candidate = str(body.get("base_url") or "").strip().rstrip("/")
-            if candidate and not valid_base_url(candidate):
-                return {"error": "base_url must be http(s)://host[:port] "
-                                 "(no path, no IPv6 literal)"}, 400
-        with self._lock:
-            cfg = self.ctx.get_config()
-            changed = False
-            if "base_url" in body:
-                cfg["base_url"] = str(body.get("base_url") or "").strip().rstrip("/")
-                changed = True
-            if "api_key" in body:
-                cfg["api_key"] = str(body.get("api_key") or "")
-                changed = True
-            if "verify_ssl" in body:
-                cfg["verify_ssl"] = bool(body["verify_ssl"])
-                changed = True
-            if "timeout" in body:
-                cfg["timeout"] = self._clamp(body["timeout"], MIN_TIMEOUT,
-                                             MAX_TIMEOUT, DEFAULT_CONFIG["timeout"])
-                changed = True
-            if "poll_interval" in body:
-                cfg["poll_interval"] = self._clamp(
-                    body["poll_interval"], MIN_POLL, MAX_POLL,
-                    DEFAULT_CONFIG["poll_interval"])
-                changed = True
-            if changed:
-                self.ctx.save_config()
-        out = self._config_snapshot()
-        # The key is write-only: accepted above, never echoed back.
-        out["api_key"] = "set" if out["api_key"] else ""
-        result: dict[str, Any] = {"config": out}
-        # Bodyless POST (the Configure… tab button): the core renderer
-        # toasts `message` from the top level, so summarize the current
-        # values there.
-        if not body:
-            result["message"] = (
-                f"Config: base_url={out['base_url'] or '(empty)'}, "
-                f"api_key={out['api_key']}, timeout={out['timeout']}s, "
-                f"verify_ssl={out['verify_ssl']}, "
-                f"poll_interval={out['poll_interval']}s — change via "
-                f"POST /api/plugin/pelican-panel/config (see README)")
-        return result, 200
 
     # ── Power task ─────────────────────────────────────────────────────────
 
@@ -778,11 +790,17 @@ class PelicanPanelPlugin(Plugin):
             if self._running:
                 return {"error": "a power action is already in progress"}, 409
             self._running = True
+            now = time.monotonic()
+            for t in targets:
+                self._pending[t["uuid"]] = (signal, t["state"], now)
         self.ctx.set_task_status(TASK_POWER, "running", "starting")
         self.ctx.run_task(TASK_POWER, lambda: self._run_power(signal, targets))
+        if len(targets) == 1:
+            what = targets[0]["name"]
+        else:
+            what = f"{len(targets)} servers"
         return {"success": True, "started": True,
-                "message": f"{SIGNAL_PROGRESS[signal].capitalize()} "
-                           f"{len(targets)} server(s)"}, 202
+                "message": f"{SIGNAL_PROGRESS[signal].capitalize()} {what}"}, 202
 
     def _run_power(self, signal: str, targets: list[dict[str, str]]) -> None:
         try:
@@ -799,33 +817,42 @@ class PelicanPanelPlugin(Plugin):
                 self.ctx.set_task_status(
                     TASK_POWER, "running",
                     f"{SIGNAL_PROGRESS[signal]} {target['name']} ({index}/{total})")
+                with self._lock:
+                    self._issued[target["uuid"]] = time.monotonic()
                 try:
-                    self._request(
-                        cfg, "POST",
-                        f"/api/client/servers/{target['uuid']}/power",
-                        {"signal": signal})
+                    request(cfg, "POST",
+                            f"/api/client/servers/{target['uuid']}/power",
+                            {"signal": signal})
                     done += 1
                 except PanelError as e:
                     failed += 1
+                    with self._lock:
+                        self._pending.pop(target["uuid"], None)
                     log.warning("pelican-panel: %s failed for %s: %s (%s)",
                                 signal, target["uuid"], e.kind, e.detail)
             verb = SIGNAL_DONE[signal]
-            message = f"{done} server(s) {verb}"
-            if failed:
-                message += f", {failed} failed"
-            kind = "success" if not failed else ("error" if not done else "warn")
+            if total == 1:
+                name = targets[0]["name"]
+                message = (f"{name} {verb}" if done
+                           else f"Could not {signal} {name}")
+            else:
+                message = f"{done} server(s) {verb}"
+                if failed:
+                    message += f", {failed} failed"
+            kind = "ok" if not failed else ("err" if not done else "info")
             self._finish("done", message, message, kind)
         except Exception as e:               # never leave single-flight wedged
             log.exception("pelican-panel: power run crashed: %s", e)
-            self._finish("error", "power run failed", "Power run failed", "error")
+            self._finish("error", "power run failed", "Power run failed", "err")
 
     def _finish(self, status: str, message: str, toast: str, kind: str) -> None:
         # Clear single-flight FIRST: a failing toast must not wedge the
         # plugin at 409 until it is reloaded.
         with self._lock:
             self._running = False
+        self._kick.set()
         try:
             self.ctx.set_task_status(TASK_POWER, status, message)
-            self.ctx.toast(toast, kind)
         except Exception:
             log.exception("pelican-panel: reporting the power result failed")
+        self._safe_toast(toast, kind)

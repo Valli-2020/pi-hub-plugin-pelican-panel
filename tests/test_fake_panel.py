@@ -3,13 +3,16 @@
 Runs a fake Pelican panel (stdlib http.server on an ephemeral port) that
 serves the JSON:API shapes the real panel uses, plus a minimal fake
 ``PluginContext`` so the plugin can be imported and driven without the Pi
-Hub core.  Run from the repo root:
+Hub core.  Run from the repo root with a Pi Hub 8.x checkout on the path:
 
-    PYTHONPATH=/home/valentin/projects/pi-hub python3 tests/test_fake_panel.py
+    PYTHONPATH=/home/pi/pi-hub-dev python3 tests/test_fake_panel.py
 
 The test covers: snapshot build (list + parallel resources + allocations),
-the flat row contract (identical keys, no None), 401 handling, power POST
-flow (body, signal, 204), single-flight 409, and inert-state exclusion.
+the /monitor payload (raw numbers, sparkline buckets), per-server and bulk
+power (body, signal, 204), single-flight 409, pending flags, the
+"stopped not by Pi Hub" toast, inert-state exclusion, config schema and
+migration, error paths, and the header pill / Settings card nodes through
+the core's own node validator.
 """
 
 from __future__ import annotations
@@ -34,7 +37,8 @@ sys.path.insert(0, REPO)
 # not valid Python identifiers).
 _INIT = os.path.join(REPO, "pi_hub_plugins", "pelican-panel", "__init__.py")
 _spec = importlib.util.spec_from_file_location(
-    "pi_hub_plugins.pelican-panel", _INIT)
+    "pi_hub_plugins.pelican-panel", _INIT,
+    submodule_search_locations=[os.path.dirname(_INIT)])
 _mod = importlib.util.module_from_spec(_spec)
 sys.modules["pi_hub_plugins.pelican-panel"] = _mod
 assert _spec.loader is not None
@@ -42,8 +46,10 @@ _spec.loader.exec_module(_mod)
 
 PelicanPanelPlugin = _mod.PelicanPanelPlugin
 valid_base_url = _mod.valid_base_url
-MAX_TIMEOUT = _mod.MAX_TIMEOUT
-MIN_POLL = _mod.MIN_POLL
+BUCKET_S = _mod.BUCKET_S
+HISTORY_S = _mod.HISTORY_S
+
+from pi_hub.plugins import contrib  # noqa: E402  (core node validator)
 
 PASS = 0
 
@@ -67,6 +73,7 @@ SERVERS = [
         "status": None,
         "is_suspended": False,
         "is_installing": False,
+        "node": "Hetzner VPS",
         "limits": {"memory": 4096, "disk": 10240, "cpu": 100},
         "relationships": {
             "allocations": {
@@ -119,7 +126,7 @@ RESOURCES = {
         },
     },
     SERVERS[1]["uuid"]: {
-        "current_state": "stopped",
+        "current_state": "offline",
         "is_suspended": False,
         "resources": {
             "memory_bytes": 0,
@@ -235,6 +242,8 @@ class FakePanel:
         self.httpd.shutdown()
 
 
+
+
 # ── Fake PluginContext ──────────────────────────────────────────────────────
 
 class FakeContext:
@@ -256,7 +265,7 @@ class FakeContext:
         with open(self._path, "w", encoding="utf-8") as fh:
             json.dump(self._cfg, fh)
 
-    def run_task(self, name: str, fn: Any) -> None:
+    def run_task(self, name: str, fn: Any, interval: float = 0) -> None:
         threading.Thread(target=fn, daemon=True).start()
 
     def set_task_status(self, name: str, status: str, message: str = "") -> None:
@@ -269,8 +278,8 @@ class FakeContext:
         self.toasts.append((message, kind))
 
 
-def make_plugin(panel: FakePanel,
-                timeout: int = 5) -> tuple[PelicanPanelPlugin, FakeContext]:
+def make_plugin(panel: FakePanel, timeout: int = 5,
+                notify_crash: bool = True) -> tuple[PelicanPanelPlugin, FakeContext]:
     tmp = tempfile.mkdtemp(prefix="pelican-test-")
     ctx = FakeContext(tmp)
     cfg = ctx.get_config()
@@ -280,6 +289,7 @@ def make_plugin(panel: FakePanel,
         "timeout": timeout,
         "verify_ssl": True,
         "poll_interval": 10,
+        "notify_crash": notify_crash,
     })
     ctx.save_config()
     plugin = PelicanPanelPlugin()
@@ -287,257 +297,306 @@ def make_plugin(panel: FakePanel,
     return plugin, ctx
 
 
-def wait_snapshot(plugin: PelicanPanelPlugin, timeout: float = 8.0) -> dict:
-    """Wait until the refresher produced a non-stale snapshot."""
+def wait_until(cond: Any, timeout: float = 8.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if cond():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def wait_snapshot(plugin: PelicanPanelPlugin, timeout: float = 8.0) -> list[dict]:
+    """Wait until the refresher produced a non-stale snapshot."""
+    def ready() -> bool:
         with plugin._lock:
-            if not plugin._stale:
-                return {"rows": [dict(r) for r in plugin._rows],
-                        "targets": [dict(t) for t in plugin._targets]}
-        time.sleep(0.05)
-    raise AssertionError("refresher produced no snapshot in time")
+            return not plugin._stale
+    if not wait_until(ready, timeout):
+        raise AssertionError("refresher produced no snapshot in time")
+    with plugin._lock:
+        return [dict(s) for s in plugin._servers]
+
+
+def wait_cycles(plugin: PelicanPanelPlugin, n: int = 1) -> None:
+    """Kick the refresher and wait for *n* more completed cycles."""
+    for _ in range(n):
+        with plugin._lock:
+            before = plugin._last_ok
+        plugin._kick.set()
+        check_ok = wait_until(lambda: plugin._last_ok != before)
+        if not check_ok:
+            raise AssertionError("refresh cycle did not complete")
+
+
+def wait_power_hits(n: int) -> None:
+    wait_until(lambda: len(FakePanelHandler.power_hits) >= n, 3.0)
+
+
+def wait_idle(plugin: PelicanPanelPlugin) -> None:
+    def idle() -> bool:
+        with plugin._lock:
+            return not plugin._running
+    wait_until(idle, 3.0)
+
+
+MC, CS, WIP = (s["uuid"] for s in SERVERS)
 
 
 def main() -> None:
     panel = FakePanel()
     try:
+        print("== descriptors ==")
+        p = PelicanPanelPlugin()
+        check("api v2, core 8", p.plugin_api_version == 2
+              and p.min_core_version == "8.0.0")
+        manifest = json.load(open(os.path.join(os.path.dirname(_INIT),
+                                               "pihub-plugin.json")))
+        root_manifest = json.load(open(os.path.join(REPO, "pihub-plugin.json")))
+        check("manifest caps == class caps",
+              manifest["capabilities"] == p.capabilities
+              and manifest["version"] == p.version
+              and root_manifest == manifest, str(manifest))
+        schema = contrib.validate_config_schema(p.get_config_schema())
+        check("config schema accepted by core",
+              [f["name"] for f in schema] == ["base_url", "api_key", "verify_ssl",
+                                             "timeout", "poll_interval",
+                                             "notify_crash"], str(schema))
+        check("api key is secret",
+              next(f for f in schema if f["name"] == "api_key")["secret"])
+        migrated = p.migrate_config("1.2.0", {"base_url": "https://x.example",
+                                              "api_key": "k", "timeout": 3,
+                                              "verify_ssl": False,
+                                              "poll_interval": 20})
+        check("1.x config migrates", migrated["notify_crash"] is True
+              and migrated["timeout"] == 3 and migrated["api_key"] == "k",
+              str(migrated))
+        frame = p.get_frames()[0]
+        check("frame files exist", all(os.path.isfile(os.path.join(
+            os.path.dirname(_INIT), "static", "frame", f))
+            for f in frame.entry + frame.css), str(frame.entry))
+        js = open(os.path.join(os.path.dirname(_INIT), "static", "frame",
+                               "monitor.js"), encoding="utf-8").read()
+        check("frame js has no </script, <!-- or innerHTML",
+              "</script" not in js and "<!--" not in js
+              and "innerHTML" not in js)
+        routes = {(r.method, r.path) for r in p.get_routes()}
+        check("routes for every frame call",
+              {("GET", "/monitor"), ("POST", "/power"),
+               ("POST", "/bulk/{action}"), ("POST", "/refresh")} == routes,
+              str(routes))
+        check("every route admin-only",
+              all(r.caps == ["admin"] for r in p.get_routes()))
+
         print("== snapshot build ==")
         plugin, ctx = make_plugin(panel)
         try:
-            snap = wait_snapshot(plugin)
-            rows = snap["rows"]
-            check("3 servers listed", len(rows) == 3, str(len(rows)))
+            servers = wait_snapshot(plugin)
+            check("3 servers listed", len(servers) == 3, str(len(servers)))
+            mc = next(s for s in servers if s["uuid"] == MC)
+            check("running state", mc["state"] == "running", mc["state"])
+            check("raw numbers", mc["cpu"] == 12.5 and mc["mem"] == 1610612736
+                  and mc["disk"] == 3221225472 and mc["uptime"] == 90061,
+                  str(mc))
+            check("limits in bytes", mc["mem_limit"] == 4096 * 1024 ** 2
+                  and mc["disk_limit"] == 10240 * 1024 ** 2
+                  and mc["cpu_limit"] == 100, str(mc))
+            check("node + primary ip", mc["node"] == "Hetzner VPS"
+                  and mc["ip"] == "10.0.0.5:25565", str(mc))
+            cs = next(s for s in servers if s["uuid"] == CS)
+            check("offline state", cs["state"] == "offline", cs["state"])
+            check("unlimited disk = 0", cs["disk_limit"] == 0, str(cs))
+            check("ip alias preferred", cs["ip"] == "cs.example.com:27015",
+                  cs["ip"])
+            wip = next(s for s in servers if s["uuid"] == WIP)
+            check("inert state shown", wip["state"] == "installing",
+                  wip["state"])
 
-            minecraft = next(r for r in rows if r["name"] == "Minecraft")
-            check("row keys identical",
-                  {tuple(r.keys()) for r in rows} == {tuple(rows[0].keys())},
-                  str([tuple(r.keys()) for r in rows]))
-            check("no None values",
-                  all(v is not None for r in rows for v in r.values()),
-                  str(rows))
-            check("running state", minecraft["status"] == "running",
-                  minecraft["status"])
-            check("cpu formatted", minecraft["cpu"] == "12%",
-                  minecraft["cpu"])
-            check("ram used/limit", minecraft["ram"] == "1.5 / 4.0 GiB",
-                  minecraft["ram"])
-            check("disk used/limit", minecraft["disk"] == "3.0 / 10 GiB",
-                  minecraft["disk"])
-            check("primary ip", minecraft["ip"] == "10.0.0.5:25565",
-                  minecraft["ip"])
-            check("uptime human", minecraft["uptime"] == "1d 1h 1m",
-                  minecraft["uptime"])
+            print("== net rate + history ==")
+            RESOURCES[MC]["resources"]["network_rx_bytes"] += 10240
+            wait_cycles(plugin)
+            with plugin._lock:
+                mc = next(s for s in plugin._servers if s["uuid"] == MC)
+            check("rx rate from counter delta", mc["rx"] is not None
+                  and mc["rx"] > 0 and mc["tx"] == 0, str(mc))
 
-            cs2 = next(r for r in rows if r["name"] == "CS2")
-            check("stopped state", cs2["status"] == "stopped",
-                  cs2["status"])
-            check("limited ram", cs2["ram"] == "0.0 / 2.0 GiB", cs2["ram"])
-            check("unlimited disk", cs2["disk"] == "0.0 GiB / ∞", cs2["disk"])
-            check("ip alias preferred", cs2["ip"] == "cs.example.com:27015",
-                  cs2["ip"])
-
-            wip = next(r for r in rows if r["name"] == "WIP-Game")
-            check("inert state shown", wip["status"] == "installing",
-                  wip["status"])
-            check("inert not a power target",
-                  all(t["uuid"] != SERVERS[2]["uuid"] for t in snap["targets"]),
-                  str(snap["targets"]))
-
-            payload = plugin.status_handler()[0]
-            check("status payload flat scalars + servers",
-                  payload["api_key"] == "set" and payload["stale"] is False
-                  and isinstance(payload["servers"], list)
-                  and payload["timeout"] == 5
-                  and payload["poll_interval"] == 10,
-                  str(payload))
+            payload, code = plugin.monitor_handler()
+            check("/monitor 200", code == 200, str(code))
             check("real api key never leaked",
                   "test-key-123" not in json.dumps(payload))
+            check("summary", payload["summary"]["running"] == 1
+                  and payload["summary"]["total"] == 3
+                  and payload["summary"]["cpu"] == 12.5,
+                  str(payload["summary"]))
+            check("configured + fresh", payload["configured"]
+                  and payload["stale"] is False and payload["notice"] == "",
+                  str(payload))
+            mc = next(s for s in payload["servers"] if s["uuid"] == MC)
+            n = HISTORY_S // BUCKET_S
+            check("120 sparkline buckets", len(mc["cpu_pts"]) == n
+                  and len(mc["mem_pts"]) == n, str(len(mc["cpu_pts"])))
+            check("latest bucket filled", mc["cpu_pts"][-1] == 12.5
+                  and mc["mem_pts"][-1] == 1536, str(mc["cpu_pts"][-3:]))
+            check("old buckets empty (gap, not zero)", mc["cpu_pts"][0] is None)
+            cs = next(s for s in payload["servers"] if s["uuid"] == CS)
+            check("offline server has no samples",
+                  all(v is None for v in cs["cpu_pts"]))
+            check("payload small", len(json.dumps(payload)) < 64 * 1024)
 
-            print("== config button ==")
-            ui = plugin.get_ui()[0]
-            config_action = next(a for a in ui.actions if a.id == "config")
-            check("config action declares fields",
-                  len(config_action.fields) == 5, str(config_action.fields))
-            check("field types allowlisted",
-                  {f["type"] for f in config_action.fields}
-                  <= {"text", "password", "number", "checkbox"},
-                  str(config_action.fields))
-            bodyless, code = plugin.config_handler()
-            check("config bodyless 200", code == 200, str(code))
-            cfg_out = bodyless["config"]
-            check("config shows masked key + values",
-                  cfg_out["api_key"] == "set"
-                  and cfg_out["base_url"] == f"http://127.0.0.1:{panel.port}"
-                  and cfg_out["timeout"] == 5
-                  and cfg_out["poll_interval"] == 10,
-                  str(cfg_out))
-            check("config bodyless toasts summary",
-                  "message" in bodyless
-                  and "POST /api/plugin/pelican-panel/config"
-                  in bodyless["message"],
-                  str(bodyless))
-            _, code = plugin.config_handler(
-                body={"base_url": "https://evil.example.com/path"})
-            check("config rejects path", code == 400, str(code))
-            _, code = plugin.config_handler(
-                body={"base_url": "https://ok.example.com:8443",
-                      "timeout": 999, "poll_interval": -5})
-            check("config clamps values", code == 200, str(code))
-            cfg_out = plugin.config_handler()[0]["config"]
-            check("clamped timeout/poll",
-                  cfg_out["timeout"] == MAX_TIMEOUT
-                  and cfg_out["poll_interval"] == MIN_POLL,
-                  str(cfg_out))
-            # Restore the working panel URL — the clamp test above
-            # mutated the live config.
-            _, code = plugin.config_handler(
-                body={"base_url": f"http://127.0.0.1:{panel.port}",
-                      "timeout": 5, "poll_interval": 10})
-            check("config restored", code == 200, str(code))
-            # Dialog payload shape: number inputs send strings, checkbox
-            # sends a bool — the handler must accept both.
-            _, code = plugin.config_handler(
-                body={"timeout": "12", "verify_ssl": False})
-            cfg_out = plugin.config_handler()[0]["config"]
-            check("dialog payload shape accepted",
-                  code == 200 and cfg_out["timeout"] == 12
-                  and cfg_out["verify_ssl"] is False,
-                  str(cfg_out))
-            _, code = plugin.config_handler(
-                body={"timeout": 5, "verify_ssl": True,
-                      "base_url": f"http://127.0.0.1:{panel.port}"})
-            check("config re-restored", code == 200, str(code))
+            # Old samples fall out of the window; bucketing averages.
+            now = time.time()
+            with plugin._lock:
+                plugin._hist[MC].appendleft((now - HISTORY_S - 5, 99.0, 1.0))
+            pts = plugin._points(plugin._hist[MC], now)[0]
+            check("sample older than the window ignored", 99.0 not in pts)
 
-            print("== bodyless actions ==")
-            _, code = plugin.start_stopped_handler()
-            check("start-stopped 202", code == 202, str(code))
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline \
-                    and not FakePanelHandler.power_hits:
-                time.sleep(0.02)
-            check("power POST hit panel", len(FakePanelHandler.power_hits) == 1,
-                  str(FakePanelHandler.power_hits))
+            print("== pill + settings card nodes ==")
+            pill = contrib.validate_node(plugin.p_pill())
+            check("pill counts running", pill["text"] == "Games 1/3"
+                  and pill["tone"] == "ok", str(pill))
+            card = contrib.validate_node(plugin.p_settings())
+            flat = json.dumps(card)
+            check("settings card valid, key masked",
+                  "test-key-123" not in flat and '"set"' in flat
+                  and '"refresh"' in flat, flat)
+
+            print("== per-server power ==")
+            FakePanelHandler.power_hits.clear()
+            body, code = plugin.power_handler(
+                body={"signal": "start", "servers": [CS, "unknown-uuid"]})
+            check("power 202", code == 202 and body["message"] == "Starting CS2",
+                  str((body, code)))
+            wait_power_hits(1)
             hit = FakePanelHandler.power_hits[0]
-            check("correct server + signal",
-                  hit["body"] == {"signal": "start"} and
-                  hit["path"].endswith(SERVERS[1]["uuid"] + "/power"),
-                  str(hit))
-            check("auth + headers",
-                  hit["auth"] == "Bearer test-key-123" and
-                  hit["content_type"] == "application/json" and
-                  hit["accept"] == "application/json",
-                  str(hit))
-
-            print("== single flight (real concurrency) ==")
-            # Block the power endpoint so the first task is genuinely in
-            # flight, then fire a second action: 202, then 409.
-            FakePanelHandler.power_hits.clear()
-            gate = threading.Event()
-            FakePanelHandler.block_power = gate
-            try:
-                _, code = plugin.start_stopped_handler()
-                check("first action 202", code == 202, str(code))
-                deadline = time.monotonic() + 3.0
-                while time.monotonic() < deadline \
-                        and not FakePanelHandler.power_hits:
-                    time.sleep(0.02)
-                _, code = plugin.start_stopped_handler()
-                check("second power run refused while in flight",
-                      code == 409, str(code))
-            finally:
-                gate.set()
-                FakePanelHandler.block_power = None
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline:
-                with plugin._lock:
-                    if not plugin._running and ctx.toasts:
-                        break
-                time.sleep(0.02)
-            check("toast fired", any("started" in t[0] for t in ctx.toasts),
-                  str(ctx.toasts))
-
-            print("== /power with explicit selection ==")
-            FakePanelHandler.power_hits.clear()
-            _, code = plugin.power_handler(
-                body={"signal": "stop",
-                      "servers": [SERVERS[0]["uuid"], "unknown-uuid"]})
-            check("power 202", code == 202, str(code))
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline \
-                    and not FakePanelHandler.power_hits:
-                time.sleep(0.02)
-            check("unknown uuid dropped",
-                  len(FakePanelHandler.power_hits) == 1 and
-                  SERVERS[0]["uuid"] in FakePanelHandler.power_hits[0]["path"],
+            check("only the known uuid hit", len(FakePanelHandler.power_hits) == 1
+                  and hit["path"].endswith(CS + "/power")
+                  and hit["body"] == {"signal": "start"},
                   str(FakePanelHandler.power_hits))
+            check("auth + headers",
+                  hit["auth"] == "Bearer test-key-123"
+                  and hit["content_type"] == "application/json"
+                  and hit["accept"] == "application/json", str(hit))
+            wait_idle(plugin)
+            check("single-server toast", ("CS2 started", "ok") in ctx.toasts,
+                  str(ctx.toasts))
+            payload = plugin.monitor_handler()[0]
+            cs = next(s for s in payload["servers"] if s["uuid"] == CS)
+            check("pending while panel still says offline",
+                  cs["pending"] == "start", str(cs["pending"]))
+            RESOURCES[CS]["current_state"] = "starting"
+            wait_cycles(plugin)
+            cs = next(s for s in plugin.monitor_handler()[0]["servers"]
+                      if s["uuid"] == CS)
+            check("pending cleared on state change", cs["pending"] == ""
+                  and cs["state"] == "starting", str(cs))
+            RESOURCES[CS]["current_state"] = "offline"
+
             _, code = plugin.power_handler(body={"signal": "explode"})
             check("invalid signal 400", code == 400, str(code))
             _, code = plugin.power_handler(body={"signal": "start",
                                                  "servers": "bogus"})
             check("invalid selector 400", code == 400, str(code))
+            FakePanelHandler.power_hits.clear()
+            body, code = plugin.power_handler(body={"signal": "start",
+                                                    "servers": [WIP]})
+            check("inert server never a target", code == 200
+                  and body["started"] is False
+                  and not FakePanelHandler.power_hits, str(body))
 
-            print("== 401 ==")
-            plugin.unload()
-            panel_mode = FakePanelHandler.mode
-            FakePanelHandler.mode = "unauthorized"
-            plugin2, _ = make_plugin(panel)
+            print("== bulk + single flight ==")
+            wait_cycles(plugin)
+            FakePanelHandler.power_hits.clear()
+            gate = threading.Event()
+            FakePanelHandler.block_power = gate
             try:
-                deadline = time.monotonic() + 8
-                while time.monotonic() < deadline:
-                    with plugin2._lock:
-                        if plugin2._error:
-                            break
-                    time.sleep(0.05)
-                with plugin2._lock:
-                    check("401 -> key hint", plugin2._error
-                          == "API key invalid or expired",
-                          plugin2._error)
+                _, code = plugin.bulk_handler(params={"action": "start-stopped"})
+                check("bulk start-stopped 202", code == 202, str(code))
+                wait_power_hits(1)
+                _, code = plugin.power_handler(body={"signal": "stop",
+                                                     "servers": [MC]})
+                check("second power run refused while in flight",
+                      code == 409, str(code))
             finally:
-                plugin2.unload()
-                FakePanelHandler.mode = panel_mode
+                gate.set()
+                FakePanelHandler.block_power = None
+            wait_idle(plugin)
+            check("bulk targeted the offline server only",
+                  [h["path"].split("/")[4] for h in FakePanelHandler.power_hits]
+                  == [CS], str(FakePanelHandler.power_hits))
+            _, code = plugin.bulk_handler(params={"action": "kill-everything"})
+            check("unknown bulk action 404", code == 404, str(code))
 
-            print("== error paths ==")
+            print("== stop detection ==")
+            ctx.toasts.clear()
+            # Our own stop: no crash toast.
+            plugin.power_handler(body={"signal": "stop", "servers": [MC]})
+            wait_idle(plugin)
+            RESOURCES[MC]["current_state"] = "offline"
+            wait_cycles(plugin)
+            check("own stop is not reported",
+                  not any("not by Pi Hub" in t[0] for t in ctx.toasts),
+                  str(ctx.toasts))
+            RESOURCES[MC]["current_state"] = "running"
+            wait_cycles(plugin)
+            with plugin._lock:
+                plugin._issued.clear()
+            RESOURCES[MC]["current_state"] = "stopped"     # legacy alias
+            wait_cycles(plugin)
+            check("foreign stop toasts",
+                  ("Minecraft stopped (not by Pi Hub)", "err") in ctx.toasts,
+                  str(ctx.toasts))
+            with plugin._lock:
+                mc = next(s for s in plugin._servers if s["uuid"] == MC)
+            check("'stopped' read as offline", mc["state"] == "offline",
+                  mc["state"])
+            RESOURCES[MC]["current_state"] = "running"
 
-            def expect_notice(mode: str, message: str, label: str) -> None:
-                FakePanelHandler.mode = mode
-                p, _ = make_plugin(panel)
-                try:
-                    deadline = time.monotonic() + 8
-                    while time.monotonic() < deadline:
-                        with p._lock:
-                            if p._error:
-                                break
-                        time.sleep(0.05)
-                    with p._lock:
-                        check(label, p._error == message, p._error)
-                    # The notice must not blank the payload contract.
-                    payload = p.status_handler()[0]
-                    check(label + " -> notice, tab intact",
-                          payload.get("notice") == message
-                          and "servers" in payload
-                          and "error" not in payload,
-                          str(payload))
-                finally:
-                    p.unload()
+            print("== config change ==")
+            plugin.on_config_change(ctx.get_config(), dict(ctx.get_config()))
+            check("refresh handler kicks", plugin.refresh_handler()[1] == 200)
+        finally:
+            plugin.unload()
 
-            expect_notice("ratelimit", "rate limited", "429 -> backoff notice")
-            expect_notice("redirect", "panel error", "3xx -> refused redirect")
+        print("== error paths ==")
+        panel_mode = FakePanelHandler.mode
+
+        def expect_notice(mode: str, message: str, label: str,
+                          pill_tone: str) -> None:
+            FakePanelHandler.mode = mode
+            p, _ = make_plugin(panel)
+            try:
+                wait_until(lambda: bool(p._error))
+                with p._lock:
+                    check(label, p._error == message, p._error)
+                payload = p.monitor_handler()[0]
+                check(label + " -> notice, payload intact",
+                      payload.get("notice") == message
+                      and "servers" in payload and "error" not in payload,
+                      str(payload))
+                pill = contrib.validate_node(p.p_pill())
+                check(label + " -> pill " + pill_tone, pill["tone"] == pill_tone,
+                      str(pill))
+            finally:
+                p.unload()
+
+        try:
+            expect_notice("unauthorized", "API key invalid or expired",
+                          "401 -> key hint", "bad")
+            expect_notice("ratelimit", "rate limited", "429 -> backoff notice",
+                          "bad")
+            expect_notice("redirect", "panel error", "3xx -> refused redirect",
+                          "bad")
             check("redirect never replayed bearer",
                   FakePanelHandler.redirect_hits == 1,
                   str(FakePanelHandler.redirect_hits))
 
-            # 409 on /resources: rows render unavailable, poll survives.
+            # 409 on /resources: servers unavailable, poll survives.
             FakePanelHandler.mode = "conflict"
             p, _ = make_plugin(panel)
             try:
-                snap = wait_snapshot(p)
-                rows = snap["rows"]
-                check("409 -> unavailable rows",
-                      all(r["status"] == "unavailable"
-                          or r["status"] in ("installing", "suspended")
-                          for r in rows),
-                      str(rows))
+                servers = wait_snapshot(p)
+                check("409 -> unavailable",
+                      all(s["state"] in ("unavailable", "installing", "suspended")
+                          for s in servers), str(servers))
             finally:
                 p.unload()
 
@@ -545,41 +604,52 @@ def main() -> None:
             FakePanelHandler.mode = "user-key"
             p, _ = make_plugin(panel)
             try:
-                snap = wait_snapshot(p)
                 check("admin-all empty -> type-less retry",
-                      len(snap["rows"]) == 3, str(snap["rows"]))
+                      len(wait_snapshot(p)) == 3)
             finally:
                 p.unload()
 
-            # slow mode: resources sleep past the request timeout ->
-            # the rows render dashes, the poll survives.
+            # slow mode: resources time out -> unknown values, poll survives.
             FakePanelHandler.mode = "slow"
             p, _ = make_plugin(panel, timeout=1)
             try:
-                snap = wait_snapshot(p)
-                rows = snap["rows"]
-                live = [r for r in rows
-                        if r["status"] not in ("installing", "suspended")]
-                check("timeout -> dash values",
-                      live and all(r["cpu"] == "–" and r["ram"] == "–"
-                                   and r["disk"] == "–" for r in live),
-                      str(rows))
+                servers = wait_snapshot(p)
+                live = [s for s in servers
+                        if s["state"] not in ("installing", "suspended")]
+                check("timeout -> None values",
+                      live and all(s["cpu"] is None and s["mem"] is None
+                                   for s in live), str(servers))
             finally:
                 p.unload()
-                FakePanelHandler.mode = panel_mode
-
-            print("== base_url validation ==")
-            check("valid url ok", valid_base_url("https://panel.example.com:8443"), "")
-            check("path rejected",
-                  not valid_base_url("https://panel.example.com/pelican"), "")
-            check("ipv6 rejected",
-                  not valid_base_url("https://[fd00::1]:8443"), "")
-            check("newline rejected", not valid_base_url("https://panel.example.com\n"),
-                  "")
-
-            print(f"ALL {PASS} CHECKS PASSED")
         finally:
-            plugin.unload()
+            FakePanelHandler.mode = panel_mode
+
+        print("== not configured ==")
+        tmp = tempfile.mkdtemp(prefix="pelican-test-")
+        ctx = FakeContext(tmp)
+        p = PelicanPanelPlugin()
+        p.load(ctx)
+        try:
+            wait_until(lambda: bool(p._error))
+            pill = contrib.validate_node(p.p_pill())
+            check("unconfigured pill muted", pill["tone"] == "muted"
+                  and pill["text"] == "Games: not set up", str(pill))
+            check("defaults written", ctx.get_config()["notify_crash"] is True
+                  and ctx.get_config()["poll_interval"] == 10)
+            check("monitor says not configured",
+                  p.monitor_handler()[0]["configured"] is False)
+        finally:
+            p.unload()
+
+        print("== base_url validation ==")
+        check("valid url ok", valid_base_url("https://panel.example.com:8443"))
+        check("path rejected",
+              not valid_base_url("https://panel.example.com/pelican"))
+        check("ipv6 rejected", not valid_base_url("https://[fd00::1]:8443"))
+        check("newline rejected",
+              not valid_base_url("https://panel.example.com\n"))
+
+        print(f"ALL {PASS} CHECKS PASSED")
     finally:
         panel.stop()
 

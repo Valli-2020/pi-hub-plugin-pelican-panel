@@ -1,119 +1,115 @@
 # Pi Hub Plugin: Pelican Panel
 
-Live Pelican Panel server table (power state, CPU, RAM, disk, IP) with
-start / stop / restart / kill actions — straight from the Pi Hub
-dashboard.
+Your Pelican game servers inside the Pi Hub dashboard: a small live
+monitor with CPU/RAM sparklines and per-server start / stop / restart /
+kill, a header pill and a Settings card.
 
 ## What it does
 
-- Lists every server the configured API key can see, refreshed in the
-  background: **power state** (`running` / `stopped` / `starting` /
-  `stopping`), **CPU** (`cpu_absolute`, 100 % = one core), **RAM** and
-  **disk** used/limit (bytes vs. MiB converted; `0` limit renders as
-  `∞`), **primary IP:port** (prefers the allocation alias), and uptime.
-- **Start stopped** / **Stop running** / **Restart running** / **Kill
-  running** buttons — global actions over the matching servers.
-- Installing/suspended servers are shown but never targeted by power
-  actions.
-- Rate-limit aware: the refresh interval auto-scales with server count,
-  429s back off and surface as an error, failures never blank the table
-  (last good snapshot + `stale` marker).
+- **Game servers tab** (a sandboxed frame): one card per server with a
+  status dot, node, `ip:port`, uptime, **CPU and RAM sparklines for the
+  last hour** (30 s buckets, gaps while the server is off), a disk bar,
+  network in/out and the buttons that fit its state:
+  - offline: **Start**
+  - running: **Stop**, **Restart**, **Kill**
+  - starting: **Stop**, **Kill**; stopping: **Kill**
+  - installing / suspended: greyed out, no buttons
+
+  Stop, Restart and Kill need a second click within 3 s (the sandbox
+  has no confirm dialog). Above the cards: running count, total CPU and
+  RAM, and the bulk actions **Start stopped**, **Stop running**,
+  **Restart running** and **Refresh**.
+- **Header pill** `Games 2/3` (running / total), next to the health
+  chips: green when servers run, grey when none run or nothing is set
+  up, amber or red when the panel cannot be polled.
+- **Settings card** "Pelican Panel": panel URL, key set yes/no, server
+  count, last poll, status, **Open panel** and **Refresh now**.
+- **Toast when a server stops without Pi Hub** (crash, in-game
+  shutdown, someone used the panel): running → offline without a stop,
+  restart or kill sent from Pi Hub in the last 3 minutes. Can be
+  switched off.
+- Rate-limit aware: the poll interval scales with the server count, 429
+  backs off, failures keep the last good data and mark it stale.
 
 ## Install
 
-1. Open **Settings → Plugins** in Pi Hub (needs an admin account).
-2. Add the repository:
+1. Open **Settings → Plugins** in Pi Hub (admin account).
+2. Add the repository `https://github.com/Valli-2020/pi-hub-plugin-pelican-panel`,
+   click **Scan**, then **Install** and **Enable**.
+3. Approve the permissions: `ui.frame` (run the tab's own JavaScript in a
+   sandboxed frame, flagged high-risk by Pi Hub), `ui.header` (the pill)
+   and `ui.settings` (the card). The plugin needs no system capability:
+   no SSH, no hosts, no Proxmox.
+4. **Configure** (Settings → Plugins → pelican-panel): panel URL and API key.
 
-   ```
-   https://github.com/Valli-2020/pi-hub-plugin-pelican-panel
-   ```
+> Requires Pi Hub **8.0+** (Plugin API v2). Upgrading from 1.x keeps the
+> existing `config.json`; Pi Hub asks once to approve the new permissions.
 
-3. Click **Scan** — the plugin appears in the list.
-4. Click **Install**, then **Enable**.
+## API key
 
-The sidebar now shows a **Pelican servers** tab.
+Use a **client API key**: in the panel, **Account → API Keys**. Client keys
+have no read/write scopes, they act as your user. A root-admin account's
+key sees every server (`?type=admin-all`); a normal account's key sees
+the servers that account can access. Set *Allowed IPs* on the key to the
+address the Pi reaches the panel from.
 
-> Requires Pi Hub **7.3.2+** (plugin-tab UI renderer).
-
-## Requirements
-
-- A **Pelican client API key** created in the *user* account
-  (Account → API Credentials) — NOT an admin Application API key. The
-  panel rejects application keys on the client API. The key sees exactly
-  the servers the account can access; a root-admin key with
-  `?type=admin-all` sees all panel servers.
-- The panel reachable from the Pi (HTTPS by default; self-signed certs
-  work via `verify_ssl = false`).
+An **application** key (Admin → API Keys, per-resource read / read-write)
+is *not* used: power control only exists in the client API, and the
+panel rejects application keys there.
 
 ## Configuration
 
-Options are persisted in the plugin's `config.json` (via `POST /config`
-or by editing the file — the Pi Hub core has no plugin config form yet,
-so after editing the file manually, disable and re-enable the plugin):
-
-| Key | Default | Meaning |
+| Field | Default | Meaning |
 |---|---|---|
-| `base_url` | `""` | Panel origin, e.g. `https://panel.example.com` — `http(s)://host[:port]` only (no path, no IPv6 literal) |
-| `api_key` | `""` | Pelican **client** API key (write-only; never shown again) |
-| `timeout` | `8` | Seconds per panel request (1–120) |
-| `verify_ssl` | `true` | Set `false` for self-signed panel certificates (per-request SSL context only) |
-| `poll_interval` | `10` | Base refresh seconds (5–3600; auto-scaled up with server count) |
+| Panel URL | — | `http(s)://host[:port]`, no path, no IPv6 literal |
+| Client API key | — | write-only; left blank on save keeps the current key |
+| Verify SSL | on | off for self-signed panel certificates (per-request SSL context only) |
+| Timeout (s) | 8 | per panel request, 1–120 |
+| Poll interval (s) | 10 | 5–3600, scaled up with the server count |
+| Toast when a server stops without Pi Hub | on | see above |
 
-Example via curl on the Pi:
+## Notes
 
-```bash
-curl -X POST http://raspberrypi:8898/api/plugin/pelican-panel/config \
-  -H "Authorization: Bearer <pi-hub-token>" \
-  -H "Content-Type: application/json" \
-  -d '{"base_url": "https://panel.example.com", "api_key": "plc_...", "verify_ssl": false}'
-```
-
-## Usage
-
-| Action | Effect |
-|---|---|
-| **Start stopped** | Sends `start` to every stopped server |
-| **Stop running** | Sends `stop` to every running server |
-| **Restart running** | Sends `restart` to every running server |
-| **Kill running** | Sends `kill` (SIGKILL) to every running server |
-| **Configure…** | Opens a form dialog (Pi Hub 7.7+): edit panel URL, API key, timeout, SSL verification and poll interval in place. On older cores it shows the current configuration as a toast instead |
-
-Power actions run as a background task (single-flight — a second action
-while one runs is refused with `409`) and end with a toast. The tab is
-polled every 10 s; the table may lag a power action by one panel-side
-cache window — the Pelican panel caches `/resources` for ~20 s, so a
-just-started server can still show `stopped` for a few seconds. That is
-the panel's cache, not a bug.
-
-> The Configure… dialog is provided by Pi Hub **7.7+** (plugin action
-> field schemas). On older cores the button only shows the current
-> values — change them with `POST /config` or by editing the plugin's
-> `config.json` and re-enabling the plugin.
+- The panel caches `/resources` for ~20 s, so a power action shows up a
+  little late. Until the state changes (at most 60 s) the card says
+  `starting…`, `stopping…` and so on.
+- Power actions run as a single background task: a second action while
+  one runs gets `409`. Each run ends with a toast.
+- `kill` is SIGKILL: no graceful shutdown, nothing saved.
+- With `/?noframes=1` the tab stays empty (frames are off); the pill and
+  the Settings card keep working.
+- Everything is admin-only. Viewers see "Admins only" in the tab and no pill.
 
 ## API (for scripting)
 
-- `GET /api/plugin/pelican-panel/status` — current snapshot
-  (`servers[]`, flat scalars, `stale`, `age_seconds`, `notice` on
-  transient failure; the table and buttons stay visible).
-- `POST /api/plugin/pelican-panel/power` — body
-  `{"signal": "start"|"stop"|"restart"|"kill", "servers": ["uuid", ...] | "all"}`.
-- `POST /api/plugin/pelican-panel/config` — set config fields.
+All routes are admin-only; the API key is never returned.
 
-All routes are admin-only. The `api_key` is never returned by any
-endpoint.
+- `GET /api/plugin/pelican-panel/monitor` — servers (raw numbers: bytes,
+  CPU %, seconds; `null` = unknown), sparkline points `cpu_pts` (%) and
+  `mem_pts` (MiB), `summary`, `stale`, `age_seconds`, `notice`, `task`.
+- `POST /api/plugin/pelican-panel/power` —
+  `{"signal": "start"|"stop"|"restart"|"kill", "servers": ["uuid", ...] | "all"}`.
+- `POST /api/plugin/pelican-panel/bulk/<action>` — `start-stopped`,
+  `stop-running`, `restart-running`.
+- `POST /api/plugin/pelican-panel/refresh` — poll now.
 
 ## Limitations
 
-- **Global actions only.** The Pi Hub generic plugin-tab renderer has no
-  per-row buttons, so power actions address all matching servers. The
-  `/power` route accepts explicit server uuids for future UIs / scripts.
-- `base_url` does not accept IPv6 literals or sub-path installs
-  (`https://host/pelican`) — reverse-proxy to the root path or use a
-  dedicated hostname.
-- `kill` is SIGKILL — no graceful shutdown, no save games flushed.
-- Redirects (3xx) from the panel are treated as errors and never
-  followed (the Authorization header must not be replayed against
-  another host).
+- No IPv6 literals or sub-path installs (`https://host/pelican`) in the
+  panel URL.
+- Redirects from the panel are errors and never followed (the key must
+  not be replayed against another host).
+- History lives in memory: it starts empty after a Pi Hub restart.
+
+## Development
+
+```bash
+PYTHONPATH=/path/to/pi-hub python3 tests/test_fake_panel.py
+```
+
+Runs a fake Pelican panel and checks the snapshot, `/monitor`, power,
+bulk, single-flight, stop detection, error paths, and the pill / card
+nodes through Pi Hub's own validator.
 
 ## License
 

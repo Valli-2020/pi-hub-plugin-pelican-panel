@@ -3,5 +3,6 @@
   "api_key": "",
   "timeout": 8,
   "verify_ssl": true,
-  "poll_interval": 10
+  "poll_interval": 10,
+  "notify_crash": true
 }

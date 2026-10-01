@@ -37,8 +37,9 @@ kill, a header pill and a Settings card.
 2. Add the repository `https://github.com/Valli-2020/pi-hub-plugin-pelican-panel`,
    click **Scan**, then **Install** and **Enable**.
 3. Approve the permissions: `ui.frame` (run the tab's own JavaScript in a
-   sandboxed frame, flagged high-risk by Pi Hub), `ui.header` (the pill)
-   and `ui.settings` (the card). The plugin needs no system capability:
+   sandboxed frame, flagged high-risk by Pi Hub), `ui.header` (the pill),
+   `ui.settings` (the card) and `ui.style` (scoped CSS that sizes the pill
+   like the header's own pills; not the global kind). The plugin needs no system capability:
    no SSH, no hosts, no Proxmox.
 4. **Configure** (Settings → Plugins → pelican-panel): panel URL and API key.
 

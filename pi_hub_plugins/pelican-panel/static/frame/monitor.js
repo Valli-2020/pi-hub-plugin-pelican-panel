@@ -8,7 +8,9 @@
   var busy = false, timer = 0, data = null;
   var cards = {};          // uuid -> card parts
   var armed = {};          // "uuid:signal" | "bulk:action" -> expiry (ms)
-  var isAdmin = ph.user.role === 'admin';
+  // The bridge learns the role only when the dashboard's init message
+  // arrives, which is after this script has started: read it when needed.
+  function isAdmin() { return ph.user.role === 'admin'; }
 
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -200,7 +202,7 @@
     c.net.textContent = s.state === 'running' ? '↓ ' + rate(s.rx) + '   ↑ ' + rate(s.tx) : '';
 
     c.btns.textContent = '';
-    if (!isAdmin || inert) return;
+    if (!isAdmin() || inert) return;
     (BUTTONS[s.state] || []).forEach(function (sig) {
       var key = s.uuid + ':' + sig;
       // While a signal is pending only Kill stays available.
@@ -227,7 +229,7 @@
     sum.appendChild(stat(gib(sm.mem || 0), 'RAM total'));
 
     bulkBox.textContent = '';
-    if (isAdmin && d.servers.length) {
+    if (isAdmin() && d.servers.length) {
       var anyOff = d.servers.some(function (s) { return s.state === 'offline'; });
       var anyOn = d.servers.some(function (s) { return s.state === 'running'; });
       bulkBox.appendChild(button('Start stopped', 'bulk:start-stopped', 'start-stopped', 'primary',
@@ -237,7 +239,7 @@
       bulkBox.appendChild(button('Restart running', 'bulk:restart-running', 'restart-running', '',
         function () { bulk('restart-running'); }, d.busy || !anyOn));
     }
-    if (isAdmin) {
+    if (isAdmin()) {
       var r = button('Refresh', 'refresh', 'refresh', '', function () { after(ph.call('refresh', { method: 'POST' })); }, false);
       bulkBox.appendChild(r);
     }

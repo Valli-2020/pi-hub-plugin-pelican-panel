@@ -111,6 +111,10 @@ BUCKET_S = 30            # one sparkline point per 30 s -> 120 points
 PENDING_TTL_S = 60       # how long a server shows "starting…" etc. at most
 OWN_ACTION_GRACE_S = 180  # a stop within this window was ours, not a crash
 
+#: Scoped under .plg-pelican-panel by the core: matches the header's own pills.
+PILL_CSS = (".ph-badge { height: 26px; padding: 0 10px; font-size: 12px; "
+            "font-weight: 500; letter-spacing: 0; }")
+
 ICON_SVG = (
     '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
     'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
@@ -180,7 +184,7 @@ def _fmt_age(seconds: int) -> str:
 
 class PelicanPanelPlugin(Plugin):
     name = "pelican-panel"
-    version = "2.0.0"
+    version = "2.0.1"
     description = (
         "Pelican game servers: live monitor with CPU/RAM sparklines, "
         "per-server start / stop / restart / kill, header pill"
@@ -188,7 +192,9 @@ class PelicanPanelPlugin(Plugin):
     min_core_version = "8.0.0"
     plugin_api_version = 2
     # No system capability: everything happens over the Pelican HTTP API.
-    capabilities = ["ui.frame", "ui.header", "ui.settings"]
+    # ui.style (scoped, not global) only sizes the header pill like its
+    # neighbours.
+    capabilities = ["ui.frame", "ui.header", "ui.settings", "ui.style"]
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -301,6 +307,8 @@ class PelicanPanelPlugin(Plugin):
                          caps=["admin"]),
             Contribution("settings.card", "connection", self.p_settings,
                          poll=30, label="Pelican Panel"),
+            # The core's header pills are 26 px; a generic badge is 20 px.
+            Contribution("style", "pill", static={"css": PILL_CSS}),
         ]
 
     # ── Config ─────────────────────────────────────────────────────────────

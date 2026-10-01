@@ -6,6 +6,21 @@ assets `pihub-plugin.json` and the versioned tarball.
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-10-01
+
+Needs one more permission, `ui.style` (scoped CSS for the header pill,
+not global); Pi Hub asks once to approve it.
+
+### Fixed
+
+- **No power buttons on any card.** The frame read the user's role once
+  at start-up, but Pi Hub's frame bridge only delivers it a moment later,
+  so everyone was treated as a viewer and every button was hidden. The
+  role is now read when the cards are drawn.
+- **The header pill was shorter than the other pills** (a generic badge is
+  20 px, the header's own pills are 26 px). A small scoped style makes it
+  26 px.
+
 ## [2.0.0] - 2026-10-01
 
 Rewritten for Pi Hub's Plugin API v2. **Needs Pi Hub 8.0+**; Pi Hub asks

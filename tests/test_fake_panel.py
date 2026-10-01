@@ -379,6 +379,14 @@ def main() -> None:
         check("frame js has no </script, <!-- or innerHTML",
               "</script" not in js and "<!--" not in js
               and "innerHTML" not in js)
+        check("frame reads the role lazily (the bridge learns it after start)",
+              "function isAdmin()" in js and "= ph.user.role" not in js)
+        styles = [c for c in p.get_contributions() if c.slot == "style"]
+        check("scoped pill css, accepted by the core",
+              len(styles) == 1 and "ui.style" in p.capabilities
+              and "ui.style.global" not in p.capabilities
+              and not styles[0].static.get("global")
+              and contrib.sanitize_css(styles[0].static["css"]), str(styles))
         routes = {(r.method, r.path) for r in p.get_routes()}
         check("routes for every frame call",
               {("GET", "/monitor"), ("POST", "/power"),

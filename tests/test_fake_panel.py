@@ -5,7 +5,7 @@ serves the JSON:API shapes the real panel uses, plus a minimal fake
 ``PluginContext`` so the plugin can be imported and driven without the Pi
 Hub core.  Run from the repo root with a Pi Hub 8.x checkout on the path:
 
-    PYTHONPATH=/home/pi/pi-hub-dev python3 tests/test_fake_panel.py
+    PYTHONPATH=/home/pi/projects/pi-hub/pi-hub-dev python3 tests/test_fake_panel.py
 
 The test covers: snapshot build (list + parallel resources + allocations),
 the /monitor payload (raw numbers, sparkline buckets), per-server and bulk

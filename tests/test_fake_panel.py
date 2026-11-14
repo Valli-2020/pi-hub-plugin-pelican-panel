@@ -365,7 +365,7 @@ def main() -> None:
               all(f.get("section") for f in raw_schema)
               and next(f for f in raw_schema if f["name"] == "api_key")["type"]
               == "password")
-        if "url" not in getattr(contrib, "FIELD_TYPES", ()):
+        if "url" not in getattr(contrib, "CONFIG_FIELD_TYPES", getattr(contrib, "FIELD_TYPES", ())):
             print("  SKIP core validator checks: contrib lacks 'url' "
                   "(core < 8.3.0 not built yet)")
         else:

@@ -6,6 +6,17 @@ assets `pihub-plugin.json` and the versioned tarball.
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-14
+
+Every setting is now in Settings -> Plugins -> Configure, grouped as
+Connection, Monitoring and Notifications. Requires Pi Hub 8.3.0.
+
+- New settings: pending state hint (`pending_ttl_s`) and own-action window
+  for crash toasts (`crash_grace_s`); both were fixed constants before.
+- The panel URL field is now a URL field.
+- Existing config files keep working: new keys are filled with the old
+  defaults, the URL is trimmed. No new permissions.
+
 ## [2.0.1] - 2026-10-01
 
 Needs one more permission, `ui.style` (scoped CSS for the header pill,

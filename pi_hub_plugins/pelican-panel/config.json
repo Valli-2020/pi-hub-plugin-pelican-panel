@@ -4,5 +4,7 @@
   "timeout": 8,
   "verify_ssl": true,
   "poll_interval": 10,
-  "notify_crash": true
+  "notify_crash": true,
+  "pending_ttl_s": 60,
+  "crash_grace_s": 180
 }

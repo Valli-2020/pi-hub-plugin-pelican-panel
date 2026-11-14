@@ -5,7 +5,7 @@ serves the JSON:API shapes the real panel uses, plus a minimal fake
 ``PluginContext`` so the plugin can be imported and driven without the Pi
 Hub core.  Run from the repo root with a Pi Hub 8.x checkout on the path:
 
-    PYTHONPATH=/home/pi/projects/pi-hub/pi-hub-dev python3 tests/test_fake_panel.py
+    PYTHONPATH=<path-to-pi-hub-dev-checkout> python3 tests/test_fake_panel.py
 
 The test covers: snapshot build (list + parallel resources + allocations),
 the /monitor payload (raw numbers, sparkline buckets), per-server and bulk
@@ -348,7 +348,7 @@ def main() -> None:
         print("== descriptors ==")
         p = PelicanPanelPlugin()
         check("api v2, core 8", p.plugin_api_version == 2
-              and p.min_core_version == "8.0.0")
+              and p.min_core_version == "8.3.0")
         manifest = json.load(open(os.path.join(os.path.dirname(_INIT),
                                                "pihub-plugin.json")))
         root_manifest = json.load(open(os.path.join(REPO, "pihub-plugin.json")))
@@ -356,20 +356,46 @@ def main() -> None:
               manifest["capabilities"] == p.capabilities
               and manifest["version"] == p.version
               and root_manifest == manifest, str(manifest))
-        schema = contrib.validate_config_schema(p.get_config_schema())
-        check("config schema accepted by core",
-              [f["name"] for f in schema] == ["base_url", "api_key", "verify_ssl",
-                                             "timeout", "poll_interval",
-                                             "notify_crash"], str(schema))
-        check("api key is secret",
-              next(f for f in schema if f["name"] == "api_key")["secret"])
-        migrated = p.migrate_config("1.2.0", {"base_url": "https://x.example",
+        raw_schema = p.get_config_schema()
+        names = ["base_url", "api_key", "verify_ssl", "timeout", "poll_interval",
+                 "pending_ttl_s", "notify_crash", "crash_grace_s"]
+        check("schema lists every setting",
+              [f["name"] for f in raw_schema] == names)
+        check("every field has a section and the key is a password",
+              all(f.get("section") for f in raw_schema)
+              and next(f for f in raw_schema if f["name"] == "api_key")["type"]
+              == "password")
+        if "url" not in getattr(contrib, "FIELD_TYPES", ()):
+            print("  SKIP core validator checks: contrib lacks 'url' "
+                  "(core < 8.3.0 not built yet)")
+        else:
+            schema = contrib.validate_config_schema(raw_schema)
+            check("config schema keeps every field",
+                  [f["name"] for f in schema] == names, str(schema))
+            check("api key is secret",
+                  next(f for f in schema if f["name"] == "api_key")["secret"])
+            defaults = {f["name"]: f["default"] for f in raw_schema
+                        if "default" in f}
+            vals, err = contrib.coerce_config_values(
+                schema, dict(defaults, base_url="https://panel.example.com"), {})
+            check("defaults coerce", err is None, str(err))
+        migrated = p.migrate_config("1.2.0", {"base_url": "https://x.example/",
                                               "api_key": "k", "timeout": 3,
                                               "verify_ssl": False,
                                               "poll_interval": 20})
         check("1.x config migrates", migrated["notify_crash"] is True
-              and migrated["timeout"] == 3 and migrated["api_key"] == "k",
-              str(migrated))
+              and migrated["timeout"] == 3 and migrated["api_key"] == "k"
+              and migrated["base_url"] == "https://x.example"
+              and migrated["verify_ssl"] is False
+              and migrated["pending_ttl_s"] == 60
+              and migrated["crash_grace_s"] == 180, str(migrated))
+        mig2 = p.migrate_config("2.0.1", {"base_url": "", "api_key": "",
+                                          "timeout": 8, "verify_ssl": True,
+                                          "poll_interval": 10,
+                                          "notify_crash": True})
+        check("2.0 live-shaped config migrates unchanged + new keys",
+              mig2["poll_interval"] == 10 and mig2["pending_ttl_s"] == 60
+              and set(mig2) == set(names), str(mig2))
         frame = p.get_frames()[0]
         check("frame files exist", all(os.path.isfile(os.path.join(
             os.path.dirname(_INIT), "static", "frame", f))
@@ -646,6 +672,30 @@ def main() -> None:
                   and ctx.get_config()["poll_interval"] == 10)
             check("monitor says not configured",
                   p.monitor_handler()[0]["configured"] is False)
+        finally:
+            p.unload()
+
+        print("== live settings ==")
+        ctx = FakeContext(tmp)
+        p = PelicanPanelPlugin()
+        p.load(ctx)
+        try:
+            old_cfg = dict(ctx.get_config())
+            ctx.get_config().update(poll_interval=30, pending_ttl_s=20,
+                                    crash_grace_s=99, base_url="https://b.example")
+            p._servers = [{"uuid": "x"}]
+            p._kick.clear()
+            p.on_config_change(old_cfg, dict(ctx.get_config()))
+            snap = p._config_snapshot()
+            check("on_config_change kicks the poller and drops old panel data",
+                  p._kick.is_set() and p._servers == [], "")
+            check("new settings read live", snap["poll_interval"] == 30
+                  and snap["pending_ttl_s"] == 20
+                  and snap["crash_grace_s"] == 99, str(snap))
+            ctx.get_config().update(pending_ttl_s=1, crash_grace_s=999999)
+            snap = p._config_snapshot()
+            check("out-of-range values are clamped",
+                  snap["pending_ttl_s"] == 10 and snap["crash_grace_s"] == 3600)
         finally:
             p.unload()
 

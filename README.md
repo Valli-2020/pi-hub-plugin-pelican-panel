@@ -60,14 +60,19 @@ panel rejects application keys there.
 
 ## Configuration
 
-| Field | Default | Meaning |
+| Field (key) | Default | Meaning |
 |---|---|---|
 | Panel URL | — | `http(s)://host[:port]`, no path, no IPv6 literal |
 | Client API key | — | write-only; left blank on save keeps the current key |
 | Verify SSL | on | off for self-signed panel certificates (per-request SSL context only) |
 | Timeout (s) | 8 | per panel request, 1–120 |
 | Poll interval (s) | 10 | 5–3600, scaled up with the server count |
+| Pending state hint (s) | 60 | how long a card shows `starting…` / `stopping…` at most, 10–600 |
 | Toast when a server stops without Pi Hub | on | see above |
+| Own-action window (s) | 180 | a stop this soon after a power action from Pi Hub is not a crash, 10–3600 |
+
+The dialog groups them as Connection, Monitoring and Notifications. All
+changes apply without a reload.
 
 ## Notes
 

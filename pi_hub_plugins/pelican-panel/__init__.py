@@ -99,17 +99,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "verify_ssl": True,
     "poll_interval": 10,
     "notify_crash": True,
+    "pending_ttl_s": 60,
+    "crash_grace_s": 180,
 }
 
 MIN_TIMEOUT, MAX_TIMEOUT = 1, 120
 MIN_POLL, MAX_POLL = 5, 3600
+MIN_PENDING, MAX_PENDING = 10, 600
+MIN_GRACE, MAX_GRACE = 10, 3600
 MAX_PAGES = 50           # page-loop guard against a misbehaving panel
 MAX_WORKERS = 8
 
 HISTORY_S = 3600         # sparkline window
 BUCKET_S = 30            # one sparkline point per 30 s -> 120 points
-PENDING_TTL_S = 60       # how long a server shows "starting…" etc. at most
-OWN_ACTION_GRACE_S = 180  # a stop within this window was ours, not a crash
+PENDING_TTL_S = 60       # default: how long a server shows "starting…" at most
+OWN_ACTION_GRACE_S = 180  # default: a stop within this window was ours, not a crash
 
 #: Scoped under .plg-pelican-panel by the core: matches the header's own pills.
 PILL_CSS = (".ph-badge { height: 26px; padding: 0 10px; font-size: 12px; "
@@ -184,12 +188,12 @@ def _fmt_age(seconds: int) -> str:
 
 class PelicanPanelPlugin(Plugin):
     name = "pelican-panel"
-    version = "2.0.1"
+    version = "2.1.0"
     description = (
         "Pelican game servers: live monitor with CPU/RAM sparklines, "
         "per-server start / stop / restart / kill, header pill"
     )
-    min_core_version = "8.0.0"
+    min_core_version = "8.3.0"
     plugin_api_version = 2
     # No system capability: everything happens over the Pelican HTTP API.
     # ui.style (scoped, not global) only sizes the header pill like its
@@ -246,27 +250,52 @@ class PelicanPanelPlugin(Plugin):
                 self._executor = None
 
     def migrate_config(self, old_version: str, config: dict) -> dict:
-        # 1.x keys are a subset of 2.0's; only the new defaults are added.
+        # 1.x/2.0 keys are a subset of 2.1's; only the new defaults are added.
+        # Keep the old shapes' values and normalise their types.
         for key, value in DEFAULT_CONFIG.items():
             config.setdefault(key, value)
+        config["base_url"] = str(config.get("base_url") or "").strip().rstrip("/")
+        for key in ("verify_ssl", "notify_crash"):
+            if not isinstance(config.get(key), bool):
+                config[key] = str(config.get(key)).strip().lower() not in (
+                    "0", "false", "no", "off", "")
         return config
 
     def get_config_schema(self) -> list[dict]:
         return [
-            {"name": "base_url", "label": "Panel URL", "type": "text",
-             "required": True, "placeholder": "https://panel.example.com",
-             "help": "scheme://host[:port], no path."},
+            {"name": "base_url", "label": "Panel URL", "type": "url",
+             "section": "Connection", "required": True,
+             "placeholder": "https://panel.example.com",
+             "help": "scheme://host[:port], no path. Applied on save."},
             {"name": "api_key", "label": "Client API key", "type": "password",
-             "help": "Panel → Account → API Keys (a client key, not an "
+             "section": "Connection",
+             "help": "Panel > Account > API Keys (a client key, not an "
                      "application key). Left blank keeps the current key."},
             {"name": "verify_ssl", "label": "Verify SSL", "type": "checkbox",
-             "default": True},
-            {"name": "timeout", "label": "Timeout (s)", "type": "number",
-             "default": 8, "min": MIN_TIMEOUT, "max": MAX_TIMEOUT},
+             "section": "Connection", "default": True,
+             "help": "Turn off only for self-signed panel certificates."},
+            {"name": "timeout", "label": "Request timeout (s)",
+             "type": "number", "section": "Connection", "default": 8,
+             "min": MIN_TIMEOUT, "max": MAX_TIMEOUT,
+             "help": "Per panel request. Applied on the next poll."},
             {"name": "poll_interval", "label": "Poll interval (s)",
-             "type": "number", "default": 10, "min": MIN_POLL, "max": MAX_POLL},
+             "type": "number", "section": "Monitoring", "default": 10,
+             "min": MIN_POLL, "max": MAX_POLL,
+             "help": "Scaled up automatically with the server count. "
+                     "Applied on save."},
+            {"name": "pending_ttl_s", "label": "Pending state hint (s)",
+             "type": "number", "section": "Monitoring", "default": 60,
+             "min": MIN_PENDING, "max": MAX_PENDING,
+             "help": "How long a card shows starting/stopping after a power "
+                     "action at most."},
             {"name": "notify_crash", "label": "Toast when a server stops "
-             "without Pi Hub", "type": "checkbox", "default": True},
+             "without Pi Hub", "type": "checkbox", "section": "Notifications",
+             "default": True},
+            {"name": "crash_grace_s", "label": "Own-action window (s)",
+             "type": "number", "section": "Notifications", "default": 180,
+             "min": MIN_GRACE, "max": MAX_GRACE,
+             "help": "A stop this soon after a power action from Pi Hub is "
+                     "not reported as a crash."},
         ]
 
     def on_config_change(self, old: dict, new: dict) -> None:
@@ -325,6 +354,10 @@ class PelicanPanelPlugin(Plugin):
             "poll_interval": self._clamp(cfg.get("poll_interval"), MIN_POLL,
                                          MAX_POLL, DEFAULT_CONFIG["poll_interval"]),
             "notify_crash": bool(cfg.get("notify_crash", True)),
+            "pending_ttl_s": self._clamp(cfg.get("pending_ttl_s"), MIN_PENDING,
+                                         MAX_PENDING, PENDING_TTL_S),
+            "crash_grace_s": self._clamp(cfg.get("crash_grace_s"), MIN_GRACE,
+                                         MAX_GRACE, OWN_ACTION_GRACE_S),
         }
 
     @staticmethod
@@ -599,7 +632,7 @@ class PelicanPanelPlugin(Plugin):
 
                 pending = self._pending.get(uuid)
                 if pending and (state != pending[1]
-                                or now - pending[2] > PENDING_TTL_S):
+                                or now - pending[2] > cfg["pending_ttl_s"]):
                     del self._pending[uuid]
 
                 if state not in LIVE_STATES:
@@ -607,7 +640,7 @@ class PelicanPanelPlugin(Plugin):
                 prev = self._prev_state.get(uuid)
                 if prev == "running" and state == "offline":
                     issued = self._issued.get(uuid)
-                    ours = issued is not None and now - issued < OWN_ACTION_GRACE_S
+                    ours = issued is not None and now - issued < cfg["crash_grace_s"]
                     if not ours and cfg["notify_crash"]:
                         crashed.append(s["name"])
                 self._prev_state[uuid] = state
